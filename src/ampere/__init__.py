@@ -221,6 +221,11 @@ class AttributionEngine:
         g = ak.GroupBy(idxs)
         unique_idxs, summed_vals = g.aggregate(vals, 'sum')
         
+        # Filter out OOB indices (e.g. ends beyond the timeline)
+        mask_valid = unique_idxs < breaks.size
+        unique_idxs = unique_idxs[mask_valid]
+        summed_vals = summed_vals[mask_valid]
+        
         diff_arr = ak.zeros(breaks.size, dtype=ak.int64)
         diff_arr[unique_idxs] += summed_vals
         return ak.cumsum(diff_arr)[:-1]
@@ -406,6 +411,12 @@ class AttributionEngine:
                     e_idx = idx_end[mask_calls_at_d]
                     
                     c_res = cum_resources_by_depth[d]
+                    
+                    # Safety clamp to prevent OOB
+                    max_valid = c_res.size - 1
+                    e_idx = ak.where(e_idx > max_valid, max_valid, e_idx)
+                    s_idx = ak.where(s_idx > max_valid, max_valid, s_idx)
+                    
                     vals = c_res[e_idx] - c_res[s_idx]
                     attributed[mask_calls_at_d] = vals
                 
@@ -469,6 +480,43 @@ class Node:
         self.ranks = ranks
         self.metrics = {m.name: m for m in metrics}
 
+    def add_derived_metric(self, name: str, func: Callable[..., Metric], *input_names: str):
+        """
+        Adds a new metric derived from existing metrics in this node.
+        
+        Args:
+            name (str): Name of the new metric.
+            func (Callable): Function that returns a new Metric.
+            *input_names (str): Names of metrics to pass as arguments to `func`.
+                                If empty, passes the entire metrics dictionary.
+        """
+        try:
+            if input_names:
+                args = []
+                missing = []
+                for n in input_names:
+                    if n in self.metrics:
+                        args.append(self.metrics[n])
+                    else:
+                        missing.append(n)
+                
+                if missing:
+                    # Fail silently or log? Let's log but not crash.
+                    print(f"Cannot derive '{name}': Missing input metrics {missing} in node '{self.name}'.")
+                    return
+
+                new_metric = func(*args)
+            else:
+                # pass dict if no specific args requested
+                new_metric = func(self.metrics)
+
+            if new_metric:
+                if new_metric.name != name:
+                    new_metric.name = name # Ensure name matches
+                self.metrics[name] = new_metric
+        except Exception as e:
+            print(f"Failed to derive metric '{name}' for node '{self.name}': {e}")
+
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> ak.DataFrame:
         """
         Attributes a specific metric to the ranks within this node.
@@ -526,6 +574,13 @@ class Run:
             Run: A populated Run instance.
         """
         return Ensemble.from_trace_paths([path], node_ranks, metric_configs).runs[0]
+
+    def add_derived_metric(self, name: str, func: Callable[..., Metric], *input_names: str):
+        """
+        Attributes a new derived metric to all nodes in the run.
+        """
+        for node in self.nodes:
+            node.add_derived_metric(name, func, *input_names)
 
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> ak.DataFrame:
         """
@@ -744,6 +799,19 @@ class Ensemble:
             if nodes: runs.append(Run(abs_path, nodes))
         return Ensemble(runs)
         
+    def add_derived_metric(self, name: str, func: Callable[..., Metric], *input_names: str):
+        """
+        Adds a derived metric to all runs in the ensemble.
+        
+        Args:
+            name (str): Name of the new metric.
+            func (Callable): Function that returns a new Metric.
+            *input_names (str): Names of metrics to pass as arguments to `func`.
+        """
+        print(f"Deriving metric '{name}'...")
+        for run in self.runs:
+            run.add_derived_metric(name, func, *input_names)
+
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver = lambda m, r: r, 
                   concurrency_mode: str = 'shared',
                   strategy: str = 'inclusive',

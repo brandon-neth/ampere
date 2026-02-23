@@ -6,7 +6,6 @@ __pycache__
 /a.out
 /arkouda_server
 /otf2csv
-/otf2csv.c
 /*.txt
 /iframe_figures
 /*.png

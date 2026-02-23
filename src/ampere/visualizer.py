@@ -12,10 +12,7 @@ class Visualizer:
     @staticmethod
     def _fast_downsample(subset: pd.DataFrame, width_pixels=2000):
         """
-        Ultra-Fast NumPy Downsampling.
-        
         Replaces pandas groupby with np.maximum.reduceat for significantly improved performance.
-        Speedup: ~100x faster than Pandas for large datasets.
         
         Args:
             subset (pd.DataFrame): Source DataFrame.
