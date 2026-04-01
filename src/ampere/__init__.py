@@ -232,7 +232,7 @@ class AttributionEngine:
 
     @staticmethod
     def compute(
-        metric: Metric,
+        metric: Optional[Metric],
         ranks: List['Rank'],
         concurrency_mode: str = 'shared',
         strategy: str = 'inclusive',
@@ -281,15 +281,22 @@ class AttributionEngine:
         """
         
         # 1. Global Timeline
-        time_arrays = [metric.times]
+        time_arrays = []
+        if metric is not None:
+            time_arrays.append(metric.times)
+            
         for r in ranks:
-            mask_s = (r.starts >= metric.t_min) & (r.starts <= metric.t_max)
-            mask_e = (r.ends >= metric.t_min) & (r.ends <= metric.t_max)
-            try:
-                if mask_s.any(): time_arrays.append(r.starts[mask_s])
-                if mask_e.any(): time_arrays.append(r.ends[mask_e])
-            except Exception:
-                # Fallback for old Arkouda versions or different array types
+            if metric is not None:
+                mask_s = (r.starts >= metric.t_min) & (r.starts <= metric.t_max)
+                mask_e = (r.ends >= metric.t_min) & (r.ends <= metric.t_max)
+                try:
+                    if mask_s.any(): time_arrays.append(r.starts[mask_s])
+                    if mask_e.any(): time_arrays.append(r.ends[mask_e])
+                except Exception:
+                    # Fallback for old Arkouda versions or different array types
+                    time_arrays.append(r.starts)
+                    time_arrays.append(r.ends)
+            else:
                 time_arrays.append(r.starts)
                 time_arrays.append(r.ends)
             
@@ -300,7 +307,10 @@ class AttributionEngine:
             return {r.name: ak.DataFrame(dict()) for r in ranks}
 
         # Compute Base Quantities (Deltas) for Attribution
-        deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
+        if metric is not None:
+            deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
+        else:
+            deltas = breaks[1:] - breaks[:-1]
         
         # Calculate active counts or max depth depending on strategy
         if strategy == 'exclusive':
@@ -432,12 +442,12 @@ class AttributionEngine:
             # Post-Process Output Mode
             final_values = attributed
             
-            if output_mode in ['rate', 'mean']:
+            if output_mode in ['rate', 'mean'] and metric is not None:
                 durations = r.ends - r.starts
                 safe_dur = ak.where(durations == 0, 1.0, durations)
                 final_values = attributed / safe_dur
                 final_values = ak.where(durations == 0, 0.0, final_values)
-            elif output_mode in ['min', 'max']:
+            elif output_mode in ['min', 'max'] and metric is not None:
                 stats = metric.get_statistics_vectorized(r.starts, r.ends)
                 if output_mode == 'min': final_values = stats['min']
                 if output_mode == 'max': final_values = stats['max']
@@ -555,6 +565,38 @@ class Node:
         combined['Node'] = ak.array([self.name] * combined[keys[0]].size)
         return ak.DataFrame(combined)
 
+    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> ak.DataFrame:
+        """
+        Profiles the time spent in functions for this node.
+        
+        Args:
+            topology_resolver (Callable): Function to filter/resolve ranks. Default includes all.
+            strategy (str): 'inclusive' or 'exclusive'.
+            
+        Returns:
+            ak.DataFrame: Attributed time results.
+        """
+        participating = topology_resolver("time", self.ranks)
+        if not participating: return ak.DataFrame(dict())
+        
+        res_dict = AttributionEngine.compute(None, participating, concurrency_mode='independent', strategy=strategy)
+        
+        dfs = []
+        for r_name, df in res_dict.items():
+            if df.size > 0:
+                nrows = df['Start Time'].size
+                df['Rank'] = ak.array([r_name] * nrows)
+                dfs.append(df)
+        
+        if not dfs: return ak.DataFrame(dict())
+        
+        keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
+        combined = {}
+        for k in keys:
+            combined[k] = ak.concatenate([d[k] for d in dfs])
+        combined['Node'] = ak.array([self.name] * combined[keys[0]].size)
+        return ak.DataFrame(combined)
+
 class Run:
     """
     Top-level container for a trace analysis session, containing multiple Nodes.
@@ -599,6 +641,28 @@ class Run:
             ak.DataFrame: Combined attribution results with an added 'Run' column.
         """
         dfs = [n.attribute(metric_name, topology_resolver, **kwargs) for n in self.nodes]
+        dfs = [d for d in dfs if d.size > 0]
+        if not dfs: return ak.DataFrame(dict())
+        
+        keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
+        combined = {}
+        for k in keys:
+            combined[k] = ak.concatenate([d[k] for d in dfs])
+        combined['Run'] = ak.array([self.name] * combined[keys[0]].size)
+        return ak.DataFrame(combined)
+
+    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> ak.DataFrame:
+        """
+        Profiles the time spent in functions across all nodes in this run.
+
+        Args:
+            topology_resolver (Callable): Rank resolution logic.
+            strategy (str): 'inclusive' or 'exclusive'.
+
+        Returns:
+            ak.DataFrame: Combined time attribution results.
+        """
+        dfs = [n.time_profile(topology_resolver, strategy=strategy) for n in self.nodes]
         dfs = [d for d in dfs if d.size > 0]
         if not dfs: return ak.DataFrame(dict())
         
@@ -850,6 +914,32 @@ class Ensemble:
             
         if not dfs: 
             raise KeyError(f"No data found for metric '{metric_name}'. Check metric name or topology.")
+        
+        keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
+        combined = {}
+        for k in keys:
+            combined[k] = ak.concatenate([d[k] for d in dfs])
+        return ak.DataFrame(combined)
+
+    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> ak.DataFrame:
+        """
+        Profiles the time spent in functions across the entire ensemble of runs.
+
+        Args:
+            topology_resolver (Callable): Function to resolve participating ranks. Default includes all.
+            strategy (str): 'inclusive' or 'exclusive'.
+
+        Returns:
+            ak.DataFrame: A concatenated DataFrame containing results from all runs.
+        """
+        dfs = []
+        print(f"Profiling time on Arkouda Server...")
+        for run in tqdm(self.runs):
+            df = run.time_profile(topology_resolver, strategy=strategy)
+            if df.size > 0: dfs.append(df)
+            
+        if not dfs: 
+            raise KeyError("No data found for time profiling. Check topology.")
         
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
