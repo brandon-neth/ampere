@@ -148,6 +148,35 @@ class Timeline:
         updated_interval = interval._replace(end=end)
         self.finished_intervals.append(updated_interval)
         
+    def add_parameter(self, name: str, value: Any) -> None:
+        '''
+        Add a parameter to the most recent live interval.
+        
+        Parameters
+        ----------
+        name : str
+            The name of the parameter to add.
+        value : Any
+            The value of the parameter to add.
+        
+        Raises
+        ------
+        ValueError
+            If there are no active intervals to add a parameter to.
+        
+        Returns
+        -------
+        None
+        '''
+        if not self.live_intervals:
+            raise ValueError("No active intervals to add a parameter to.")
+        
+        interval = self.live_intervals[-1]
+        updated_metadata = dict(interval.metadata) if interval.metadata is not None else {}
+        updated_metadata[name] = value
+        updated_interval = interval._replace(metadata=updated_metadata)
+        self.live_intervals[-1] = updated_interval
+
     def get_intervals_between(self, start: float, end: float) -> List[Interval]:
         '''
         Get all finished intervals that overlap with the given time range.
@@ -647,7 +676,7 @@ class TestMetricAttribution(unittest.TestCase):
 def callgraph_to_csv(call_graph: CallGraph, group: str, thread: str, filename: str):
     """Convert a CallGraph to a CSV file."""
     with open(filename, 'w') as f:
-        f.write("Thread,Group,Depth,Name,Start Time,End Time,Duration\n")
+        f.write("Thread,Group,Depth,Name,Start Time,End Time,Duration,Metadata\n")
         intervals = call_graph.get_intervals_between(float('-inf'), float('inf'))
         
         for interval in intervals:
@@ -656,8 +685,9 @@ def callgraph_to_csv(call_graph: CallGraph, group: str, thread: str, filename: s
             duration = end - start
             name = interval.name if interval.name else "Unknown"
             depth = interval.depth if interval.depth else 0
+            metadata = interval.metadata if interval.metadata else {}
 
-            f.write(f"{thread},{group},{depth},\"{name}\",{start},{end},{duration}\n")
+            f.write(f"{thread},{group},{depth},\"{name}\",{start},{end},{duration},\"{metadata}\"\n")
 
 def metrics_to_csv(group: str, thread_metrics: Dict[str, List[Tuple[float, float]]], filename: str):
     """Convert metrics to a CSV file."""
@@ -708,7 +738,9 @@ def process_location(location, trace_path, METRICS_TO_TRACK, thread_id=None, sho
                     local_metrics[metric_name] = []
                 if len(local_metrics[metric_name]) == 0 or local_metrics[metric_name][-1][1] != event.value:
                     local_metrics[metric_name].append((current_time, event.value))
-            
+            elif isinstance(event, otf2.events.ParameterInt):
+                call_graph.add_parameter(event.parameter.name, event.value)
+                continue
             elif isinstance(event, otf2.events.Enter):
                 call_graph.enter(current_time, name=event.region.name)
             elif isinstance(event, otf2.events.Leave):

@@ -445,9 +445,11 @@ class AttributionEngine:
             res_data = {
                 'Start Time': r.starts,
                 'End Time': r.ends,
+                'Duration': r.ends - r.starts,
                 'Name': r.names,
                 'Depth': r.depths,
-                'Value': final_values
+                'Value': final_values,
+                'Metadata': r.metadata
             }
             results[r.name] = ak.DataFrame(res_data)
 
@@ -469,6 +471,8 @@ class Rank:
         self.ends = df['End Time']
         self.names = df['Name']
         self.depths = df['Depth']
+        self.durations = self.ends - self.starts
+        self.metadata = df.get('Metadata', None)  # Optional additional data
     def __repr__(self): return f"Rank({self.name})"
 
 class Node:
@@ -732,7 +736,7 @@ class Ensemble:
                 # Helper to parse one file
                 def parse_callgraph_client(path):
                     try:
-                        data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': []}
+                        data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
                         with open(path, 'r') as f:
                             reader = csv.reader(f, delimiter=',')
                             header = next(reader, None) # Skip header
@@ -744,7 +748,14 @@ class Ensemble:
                                 data['Name'].append(row[3])
                                 data['Start Time'].append(float(row[4]))
                                 data['End Time'].append(float(row[5]))
-                                data['Duration'].append(float(row[6]))
+                                if len(row) > 6:
+                                    data['Duration'].append(float(row[6]))
+                                else:
+                                    data['Duration'].append(float(row[5]) - float(row[4]))
+                                if len(row) > 7:
+                                    data['Metadata'].append(row[7])
+                                else:
+                                    data['Metadata'].append('')
                         return (path, data)
                     except Exception as e:
                         return (path, e)
@@ -776,6 +787,7 @@ class Ensemble:
                                 ak_dict['Duration'] = ak.array(result['Duration'])
                                 ak_dict['Name'] = ak.array(result['Name'])
                                 ak_dict['Group'] = ak.array(result['Group'])
+                                ak_dict['Metadata'] = ak.array(result['Metadata'])
                                 
                                 c_df = ak.DataFrame(ak_dict)
                                 
