@@ -1,6 +1,6 @@
-import arkouda as ak
 import os
 import atexit
+from ._backend import ak, get_backend
 
 class AmpereSession:
     """
@@ -22,6 +22,9 @@ class AmpereSession:
         self.connected = False
 
     def __enter__(self):
+        if get_backend() == 'pandas':
+            print("Pandas backend active — skipping Arkouda connection.")
+            return self
         try:
             print(f"Connecting to Arkouda server at {self.server}:{self.port}...")
             ak.connect(server=self.server, port=self.port, timeout=self.timeout)
@@ -55,7 +58,9 @@ def connect(server="localhost", port=5555):
         - Establishes a global Arkouda connection.
         - Registers `ak.disconnect` to run on interpreter exit.
     """
+    if get_backend() == 'pandas':
+        print("Pandas backend active — skipping Arkouda connection.")
+        return
     print(f"Connecting to Arkouda server at {server}:{port}...")
     ak.connect(server=server, port=port)
-    # Register disconnect on exit just in case
     atexit.register(ak.disconnect)
