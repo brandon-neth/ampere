@@ -2,10 +2,9 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import arkouda as ak
+from ._backend import ak
 import matplotlib.pyplot as plt
 import seaborn as sns
-import arkouda as ak
 from . import MetricType
 
 class Visualizer:

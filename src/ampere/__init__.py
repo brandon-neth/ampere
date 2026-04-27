@@ -1,5 +1,5 @@
-import arkouda as ak
-import numpy as np 
+import numpy as np
+from ._backend import ak, set_backend, get_backend  # noqa: F401
 import os
 import re
 import csv
@@ -43,21 +43,55 @@ class MetricConfig:
 TopologyResolver = Callable[[str, List['Rank']], List['Rank']]
 
 # ==========================================
+# 1b. Backend-neutral DataFrame type
+# ==========================================
+
+class _DataFrameMeta(type):
+    """Metaclass so isinstance() and construction delegate to the active backend."""
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, ak.DataFrame)
+
+    def __call__(cls, data=None):
+        return ak.DataFrame(data)
+
+
+class DataFrame(metaclass=_DataFrameMeta):
+    """
+    Backend-neutral DataFrame type.
+
+    Works identically regardless of whether the arkouda or pandas backend is
+    active.  Import it instead of ``arkouda.DataFrame`` in notebooks:
+
+        from ampere import DataFrame, set_backend
+        set_backend('pandas')           # or 'arkouda'
+
+        df = DataFrame({'col': arr})    # constructs the right type
+        isinstance(df, DataFrame)       # True on both backends
+        df = DataFrame.concat([a, b])   # concatenates on the right backend
+    """
+
+    @staticmethod
+    def concat(dfs):
+        """Concatenate a list of DataFrames using the active backend."""
+        return ak.DataFrame.concat(dfs)
+
+
+# ==========================================
 # 2. Math & Logic Core
 # ==========================================
 
-def ak_interp1d(x: ak.pdarray, y: ak.pdarray, xi: ak.pdarray, kind: str = 'linear') -> ak.pdarray:
+def ak_interp1d(x: np.ndarray, y: np.ndarray, xi: np.ndarray, kind: str = 'linear') -> np.ndarray:
     """
     Performs one-dimensional linear interpolation on Arkouda arrays.
     
     Args:
-        x (ak.pdarray): X-coordinates of the data points (must be sorted).
-        y (ak.pdarray): Y-coordinates of the data points.
-        xi (ak.pdarray): X-coordinates at which to evaluate the interpolated values.
+        x (np.ndarray): X-coordinates of the data points (must be sorted).
+        y (np.ndarray): Y-coordinates of the data points.
+        xi (np.ndarray): X-coordinates at which to evaluate the interpolated values.
         kind (str): Interpolation type ('linear' or 'previous'). 'previous' works like step-post.
 
     Returns:
-        ak.pdarray: The interpolated values.
+        np.ndarray: The interpolated values.
     """
     # 1. Find indices of xi in x
     idx = ak.searchsorted(x, xi)
@@ -89,12 +123,12 @@ class Metric:
     
     Attributes:
         name (str): The name of the metric.
-        times (ak.pdarray): Array of monotonically increasing timestamps (float64).
-        raw_values (ak.pdarray): Array of metric values corresponding exactly to `times` (float64).
+        times (np.ndarray): Array of monotonically increasing timestamps (float64).
+        raw_values (np.ndarray): Array of metric values corresponding exactly to `times` (float64).
         config (MetricConfig): Configuration defining metric type (INSTANTANEOUS/CUMULATIVE) and scaling factor.
-        cum_values (ak.pdarray): Integrated cumulative values derived from raw values (used for delta calculations).
+        cum_values (np.ndarray): Integrated cumulative values derived from raw values (used for delta calculations).
     """
-    def __init__(self, name: str, times: ak.pdarray, values: ak.pdarray, config: MetricConfig):
+    def __init__(self, name: str, times: np.ndarray, values: np.ndarray, config: MetricConfig):
         self.name = name
         self.kind = config.kind
         
@@ -128,20 +162,20 @@ class Metric:
             self.cum_values = self.raw_values
 
     @property
-    def values(self) -> ak.pdarray:
+    def values(self) -> np.ndarray:
         """Alias for raw_values to support legacy/external access."""
         return self.raw_values
 
-    def get_delta_vectorized(self, t_starts: ak.pdarray, t_ends: ak.pdarray) -> ak.pdarray:
+    def get_delta_vectorized(self, t_starts: np.ndarray, t_ends: np.ndarray) -> np.ndarray:
         """
         Calculates the change in metric value for a set of time intervals.
         
         Args:
-            t_starts (ak.pdarray): Array of interval start times.
-            t_ends (ak.pdarray): Array of interval end times.
+            t_starts (np.ndarray): Array of interval start times.
+            t_ends (np.ndarray): Array of interval end times.
 
         Returns:
-            ak.pdarray: The delta (change in value) for each interval.
+            np.ndarray: The delta (change in value) for each interval.
         """
         t_s = ak.where(t_starts < self.t_min, self.t_min, t_starts)
         t_e = ak.where(t_ends > self.t_max, self.t_max, t_ends)
@@ -151,10 +185,10 @@ class Metric:
         val_end   = ak_interp1d(self.times, self.cum_values, t_e, kind='linear')
         return ak.where(valid, val_end - val_start, 0.0)
 
-    def get_statistics_vectorized(self, t_starts: ak.pdarray, t_ends: ak.pdarray) -> Dict[str, ak.pdarray]:
+    def get_statistics_vectorized(self, t_starts: np.ndarray, t_ends: np.ndarray) -> Dict[str, np.ndarray]:
         """
         Computes vectorized statistics for each interval [start, end].
-        Returns a dict of ak.pdarrays: 'min', 'max', 'mean', 'rate', 'sum'.
+        Returns a dict of np.ndarrays: 'min', 'max', 'mean', 'rate', 'sum'.
         """
         # Clamp intervals to the metric's time range
         t_s = ak.where(t_starts < self.t_min, self.t_min, t_starts)
@@ -186,7 +220,7 @@ class AttributionEngine:
     Engine for attributing metric values to call graph ranks based on time and depth.
     """
     @staticmethod
-    def _compute_coverage_ak(starts: ak.pdarray, ends: ak.pdarray, breaks: ak.pdarray) -> ak.pdarray:
+    def _compute_coverage_ak(starts: np.ndarray, ends: np.ndarray, breaks: np.ndarray) -> np.ndarray:
         """
         Computes the number of intervals covered by each segment [start, end] in the `breaks` timeline.
         
@@ -195,12 +229,12 @@ class AttributionEngine:
         For example, breaks=[0, 10, 20] defines intervals [0, 10) and [10, 20).
 
         Args:
-            starts (ak.pdarray): Start times of the segments.
-            ends (ak.pdarray): End times of the segments.
-            breaks (ak.pdarray): Global timeline of unique timestamps defining intervals.
+            starts (np.ndarray): Start times of the segments.
+            ends (np.ndarray): End times of the segments.
+            breaks (np.ndarray): Global timeline of unique timestamps defining intervals.
 
         Returns:
-            ak.pdarray: An array where each element corresponds to an interval defined by `breaks` (size = breaks.size - 1).
+            np.ndarray: An array where each element corresponds to an interval defined by `breaks` (size = breaks.size - 1).
                         The value at index `i` is the count of segments that overlap with interval `i`.
         """
         l_idx = ak.searchsorted(breaks, starts, side='right') - 1
@@ -231,13 +265,101 @@ class AttributionEngine:
         return ak.cumsum(diff_arr)[:-1]
 
     @staticmethod
+    def _exclusive_pandas(starts_np: np.ndarray, ends_np: np.ndarray, weights: np.ndarray,
+                          depths_np: np.ndarray = None) -> np.ndarray:
+        """
+        O(K log K) exclusive attribution via the identity:
+            exclusive[k] = inclusive[k] - sum(inclusive[direct_children_of_k])
+
+        When depths_np is supplied, parents are found with pure-numpy searchsorted
+        per depth level — works for consecutive (0,1,2) and gapped (0,2,5) depths.
+        Falls back to the list-stack algorithm only when no depth info is available.
+        """
+        K = len(starts_np)
+        if K == 0:
+            return np.array([], dtype=np.float64)
+
+        parent = np.full(K, -1, dtype=np.int64)
+
+        if depths_np is not None:
+            depth_vals = np.asarray(depths_np, dtype=np.int64)
+            unique_d   = np.unique(depth_vals)
+        else:
+            unique_d   = np.array([], dtype=np.int64)
+
+        _use_stack_walk = True
+        if depths_np is not None and len(unique_d) > 1:
+            # Generalised depth path: works for consecutive (0,1,2) AND gapped (0,2,5)
+            # depths. For each depth level d, the parent is the last shallower call
+            # (any depth < d) that started before the child AND ends after it.
+            # Pure-numpy, O(K log K) total — no Python loop over calls.
+            # If any non-enclosing spans are found (non-nested / unusual trace),
+            # the for-else aborts and the stack walk below handles it instead.
+            for d in unique_d[1:]:
+                c_idxs     = np.where(depth_vals == d)[0]
+                p_idxs_raw = np.where(depth_vals < d)[0]
+                if len(p_idxs_raw) == 0:
+                    continue
+                p_ord           = np.argsort(starts_np[p_idxs_raw], kind='stable')
+                p_starts_sorted = starts_np[p_idxs_raw[p_ord]]
+                p_orig          = p_idxs_raw[p_ord]
+
+                pos   = np.searchsorted(p_starts_sorted, starts_np[c_idxs], side='right') - 1
+                valid = pos >= 0
+
+                if not np.any(valid):
+                    continue
+
+                cand_p   = p_orig[pos[valid]]
+                cand_c   = c_idxs[valid]
+                enclosed = ends_np[cand_p] >= ends_np[cand_c]
+
+                if not np.all(enclosed):
+                    # Non-nested spans detected — abort and use stack walk
+                    break
+
+                parent[cand_c] = cand_p
+            else:
+                _use_stack_walk = False  # depth path succeeded for all levels
+
+        if _use_stack_walk:
+            # No depth info (or single depth): stack walk — O(K) amortised.
+            # If starts are strictly increasing (typical HPC trace order) skip lexsort.
+            if K > 1 and bool(np.all(starts_np[1:] > starts_np[:-1])):
+                order = list(range(K))
+            else:
+                order = np.lexsort((-ends_np, starts_np)).tolist()
+            starts_lst = starts_np.tolist()
+            ends_lst   = ends_np.tolist()
+            parent_lst = [-1] * K
+            stack_e: list = []
+            stack_i: list = []
+
+            for k in order:
+                sk = starts_lst[k]
+                while stack_e and stack_e[-1] <= sk:
+                    stack_e.pop()
+                    stack_i.pop()
+                if stack_e:
+                    parent_lst[k] = stack_i[-1]
+                stack_e.append(ends_lst[k])
+                stack_i.append(k)
+
+            parent = np.asarray(parent_lst, dtype=np.int64)
+
+        valid        = parent >= 0
+        children_sum = np.bincount(parent[valid].astype(np.intp),
+                                   weights=weights[valid], minlength=K)
+        return np.maximum(0.0, weights - children_sum)
+
+    @staticmethod
     def compute(
         metric: Optional[Metric],
         ranks: List['Rank'],
         concurrency_mode: str = 'shared',
         strategy: str = 'inclusive',
         output_mode: str = 'quantity'
-    ) -> Dict[str, ak.DataFrame]:
+    ) -> Dict[str, Any]:
         """
         Attributes metric values to the provided ranks using the specified strategy.
 
@@ -277,171 +399,227 @@ class AttributionEngine:
             output_mode (str): 'quantity' (raw attributed value), 'rate' (per second), 'mean', 'min', 'max'.
 
         Returns:
-            Dict[str, ak.DataFrame]: A dictionary mapping rank names to a DataFrame of attributed results.
+            Dict[str, Any]: A dictionary mapping rank names to a DataFrame of attributed results.
         """
-        
+
+        # Fast path for pandas backend + independent concurrency.
+        # inclusive[k] = metric.get_delta_vectorized(s_k, e_k) — direct interpolation, no global timeline.
+        # For time profile (metric=None) inclusive[k] = duration.
+        if get_backend() == 'pandas' and concurrency_mode == 'independent':
+            results = {}
+            for r in ranks:
+                s = np.asarray(r.starts, dtype=np.float64)
+                e = np.asarray(r.ends,   dtype=np.float64)
+                if metric is not None:
+                    inclusive = np.asarray(metric.get_delta_vectorized(r.starts, r.ends), dtype=np.float64)
+                else:
+                    inclusive = e - s
+                if strategy == 'exclusive':
+                    val = AttributionEngine._exclusive_pandas(
+                        s, e, inclusive,
+                        depths_np=np.asarray(r.depths, dtype=np.int64),
+                    )
+                else:
+                    val = inclusive
+                if output_mode in ('rate', 'mean') and metric is not None:
+                    dur = e - s
+                    safe_dur = np.where(dur == 0, 1.0, dur)
+                    val = np.where(dur == 0, 0.0, val / safe_dur)
+                elif output_mode in ('min', 'max') and metric is not None:
+                    stats = metric.get_statistics_vectorized(r.starts, r.ends)
+                    val = np.asarray(stats[output_mode], dtype=np.float64)
+                results[r.name] = ak.DataFrame({
+                    'Start Time': r.starts, 'End Time': r.ends,
+                    'Duration':   r.ends - r.starts,
+                    'Name':       r.names,  'Depth': r.depths,
+                    'Value':      ak.array(val),
+                    'Metadata':   r.metadata,
+                })
+            return results
+
+        # Pandas fast path for shared mode:
+        # np.unique(return_inverse=True) on all timestamps at once — eliminates all per-rank
+        # searchsorted calls (replaced by O(1) index lookup from inverse).
+        # bincount replaces GroupBy for coverage — O(N) vs O(N log N).
+        if get_backend() == 'pandas':
+            # --- Build merged timeline once ---
+            parts: list = []
+            n_mt = 0
+            if metric is not None:
+                mt_np = np.asarray(metric.times, dtype=np.float64)
+                parts.append(mt_np)
+                n_mt = len(mt_np)
+
+            rank_s = [np.asarray(r.starts, dtype=np.float64) for r in ranks]
+            rank_e = [np.asarray(r.ends,   dtype=np.float64) for r in ranks]
+            for s in rank_s: parts.append(s)
+            for e in rank_e: parts.append(e)
+
+            merged_np = np.concatenate(parts)
+            breaks_np, inv = np.unique(merged_np, return_inverse=True)
+            N = len(breaks_np) - 1
+            if N < 1:
+                return {r.name: ak.DataFrame(dict()) for r in ranks}
+
+            # --- Extract per-rank break indices from the inverse (no searchsorted) ---
+            # merged layout: [metric_times | rank0_starts | rank1_starts | … | rank0_ends | rank1_ends | …]
+            cur = n_mt
+            rank_l = []   # inv[start position] = break index of call start
+            for s in rank_s:
+                rank_l.append(inv[cur:cur+len(s)])
+                cur += len(s)
+            rank_ei = []  # inv[end position] = break index of call end (= r_idx+1 for cumsum)
+            for e in rank_e:
+                rank_ei.append(inv[cur:cur+len(e)])
+                cur += len(e)
+
+            # --- Deltas: evaluate metric at all break points at once ---
+            if metric is not None:
+                mt_np_arr = np.asarray(metric.times,     dtype=np.float64)
+                cv_np_arr = np.asarray(metric.cum_values, dtype=np.float64)
+                E_at_breaks = np.interp(breaks_np, mt_np_arr, cv_np_arr)
+                deltas = np.maximum(np.diff(E_at_breaks), 0.0)
+            else:
+                deltas = np.diff(breaks_np)
+
+            # --- Active-rank count per interval via bincount (one pass per rank) ---
+            if concurrency_mode == 'shared':
+                active_counts = np.zeros(N, dtype=np.int64)
+                for li, ei in zip(rank_l, rank_ei):
+                    pos = np.bincount(np.clip(li, 0, N), minlength=N+1)
+                    neg = np.bincount(np.clip(ei, 0, N), minlength=N+1)
+                    cov = np.cumsum((pos - neg).astype(np.int64))[:N]
+                    active_counts += (cov > 0).astype(np.int64)
+                per_rank_resource = deltas / np.maximum(1, active_counts)
+            else:
+                per_rank_resource = deltas
+
+            cum = np.concatenate([[0.0], np.cumsum(per_rank_resource)])
+
+            # --- Per-rank attribution ---
+            results = {}
+            for i, r in enumerate(ranks):
+                L = np.clip(rank_l[i],  0, N).astype(np.int64)
+                R = np.clip(rank_ei[i], 0, N).astype(np.int64)
+
+                inclusive = cum[R] - cum[L]
+                inclusive[R <= L] = 0.0
+
+                if strategy == 'exclusive':
+                    val = AttributionEngine._exclusive_pandas(
+                        rank_s[i], rank_e[i], inclusive,
+                        depths_np=np.asarray(r.depths, dtype=np.int64),
+                    )
+                else:
+                    val = inclusive
+
+                if output_mode in ('rate', 'mean') and metric is not None:
+                    dur = rank_e[i] - rank_s[i]
+                    val = np.where(dur == 0, 0.0, val / np.where(dur == 0, 1.0, dur))
+                elif output_mode in ('min', 'max') and metric is not None:
+                    stats = metric.get_statistics_vectorized(r.starts, r.ends)
+                    val = np.asarray(stats[output_mode], dtype=np.float64)
+
+                results[r.name] = ak.DataFrame({
+                    'Start Time': r.starts, 'End Time': r.ends,
+                    'Duration':   r.ends - r.starts,
+                    'Name':       r.names,  'Depth': r.depths,
+                    'Value':      ak.array(val),
+                    'Metadata':   r.metadata,
+                })
+            return results
+
+        # ---- Arkouda backend: original pipeline ----
+
         # 1. Global Timeline
         time_arrays = []
         if metric is not None:
             time_arrays.append(metric.times)
-            
+
         for r in ranks:
             if metric is not None:
-                mask_s = (r.starts >= metric.t_min) & (r.starts <= metric.t_max)
-                mask_e = (r.ends >= metric.t_min) & (r.ends <= metric.t_max)
+                mask_overlap = (r.ends >= metric.t_min) & (r.starts <= metric.t_max)
                 try:
-                    if mask_s.any(): time_arrays.append(r.starts[mask_s])
-                    if mask_e.any(): time_arrays.append(r.ends[mask_e])
+                    if mask_overlap.any():
+                        time_arrays.append(r.starts[mask_overlap])
+                        time_arrays.append(r.ends[mask_overlap])
                 except Exception:
-                    # Fallback for old Arkouda versions or different array types
                     time_arrays.append(r.starts)
                     time_arrays.append(r.ends)
             else:
                 time_arrays.append(r.starts)
                 time_arrays.append(r.ends)
-            
+
         merged = ak.concatenate(time_arrays)
         breaks = ak.unique(merged)
-        
+
         if breaks.size < 2:
             return {r.name: ak.DataFrame(dict()) for r in ranks}
 
-        # Compute Base Quantities (Deltas) for Attribution
         if metric is not None:
             deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
         else:
             deltas = breaks[1:] - breaks[:-1]
-        
-        # Calculate active counts or max depth depending on strategy
-        if strategy == 'exclusive':
-            # Exclusive attribution logic handled later.
-            pass 
-        else:
+
+        rank_coverages = []
+        if concurrency_mode == 'shared':
             active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
             for r in ranks:
                 c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
+                rank_coverages.append(c)
                 active_counts += ak.where(c > 0, 1, 0)
-
-            if concurrency_mode == 'shared':
-                scaling = ak.where(active_counts < 1, 1, active_counts)
-                per_rank_resource = deltas / scaling.astype(ak.float64)
-            else:
-                per_rank_resource = deltas
-
-            # Accumulate Resource
-            zeros = ak.zeros(1, dtype=ak.float64)
-            cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
-        
-        results = {}
-        
-        # Optimize: Pre-compute max depth for each rank if exclusive
-        # If exclusive, we don't have a single global "cum_resource" because each rank might claim different parts differently?
-        # Actually, if concurrency_mode=shared, we split the metric among active RANKS first.
-        # THEN within the rank, we give it to the deepest function.
-        
-        # Let's handle concurrency first (split metric between Ranks)
-        # Then handle exclusive (split metric within Rank)
-        
-        # Re-calc active_counts for concurrency splitting (needed for both)
-        active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
-        rank_coverages = []
-        for r in ranks:
-            c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
-            rank_coverages.append(c)
-            active_counts += ak.where(c > 0, 1, 0)
-            
-        if concurrency_mode == 'shared':
             scaling = ak.where(active_counts < 1, 1, active_counts)
             per_rank_resource = deltas / scaling.astype(ak.float64)
         else:
             per_rank_resource = deltas
 
-        # Now per_rank_resource is the amount of resource available to be claimed by THIS rank in this interval.
-        # Use this to build a cumulative curve? 
-        # For inclusive, we just need to know if we are active.
-        # For exclusive, we need to know if we are the DEEPEST active.
-        
+        results = {}
         for i, r in enumerate(ranks):
-            # 1. Identify intervals where this rank is active
-            # We have rank_coverages[i] which tells us overlap count (>=1 if active)
-            # But for exclusive, we need to check depths.
-            
-            # Get start/end indices in 'breaks' for each function call
             l_idx = ak.searchsorted(breaks, r.starts, side='right') - 1
             r_idx = ak.searchsorted(breaks, r.ends, side='left') - 1
-            
+
             idx_start = ak.where(l_idx < 0, 0, l_idx)
-            # max_idx is breaks.size-1 (intervals) -> cum_resource has size intervals+1
             max_idx = breaks.size - 1
             idx_end = r_idx + 1
             idx_end = ak.where(idx_end > max_idx, max_idx, idx_end)
             mask_valid = idx_end > idx_start
-            
-            if strategy == 'exclusive':
-                # Exclusive Attribution Strategy:
-                # We need to determine the maximum active depth for each interval to strictly attribute
-                # resources to the deepest active function.
-                #
-                # Algorithm:
-                # 1. Identify all unique depths in the call graph.
-                # 2. Iterate through depths (active depths update the max_depth_per_interval array).
-                # 3. Create a cumulative resource array for each depth, masking out intervals where
-                #    that depth is not the maximum.
-                # 4. Attribute resources to function calls based on their depth and the exclusive resource pool.
 
+            if strategy == 'exclusive':
+                # Arkouda backend — original depth-loop algorithm
                 unique_depths = ak.unique(r.depths)
                 unique_depths = ak.sort(unique_depths)
-                
-                # Initialize max active depth per interval
                 max_depth_per_interval = ak.zeros(breaks.size - 1, dtype=ak.int64) - 1
-                
-                # Determine max active depth for each interval
                 for d in unique_depths.to_ndarray():
                     mask_d = r.depths == d
                     cov = AttributionEngine._compute_coverage_ak(r.starts[mask_d], r.ends[mask_d], breaks)
-                    # Update max_depth if this depth is active (higher depths overwrite lower ones)
                     max_depth_per_interval = ak.where(cov > 0, d, max_depth_per_interval)
-                
-                # Pre-calculate cumulative resources for each depth level
                 cum_resources_by_depth = {}
                 for d in unique_depths.to_ndarray():
                     mask_max_d = max_depth_per_interval == int(d)
                     res_d = ak.where(mask_max_d, per_rank_resource, 0.0)
                     zeros = ak.zeros(1, dtype=ak.float64)
                     cum_resources_by_depth[d] = ak.concatenate([zeros, ak.cumsum(res_d)])
-                
-                # Assign attributed values to calls
                 attributed = ak.zeros(r.starts.size, dtype=ak.float64)
-                
                 for d in unique_depths.to_ndarray():
                     mask_calls_at_d = r.depths == d
                     if not mask_calls_at_d.any(): continue
-                    
                     s_idx = idx_start[mask_calls_at_d]
                     e_idx = idx_end[mask_calls_at_d]
-                    
                     c_res = cum_resources_by_depth[d]
-                    
-                    # Safety clamp to prevent OOB
                     max_valid = c_res.size - 1
                     e_idx = ak.where(e_idx > max_valid, max_valid, e_idx)
                     s_idx = ak.where(s_idx > max_valid, max_valid, s_idx)
-                    
                     vals = c_res[e_idx] - c_res[s_idx]
                     attributed[mask_calls_at_d] = vals
-                
+
             else:
-                # Inclusive
-                # Resource is just per_rank_resource
                 zeros = ak.zeros(1, dtype=ak.float64)
                 cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
-                
                 vals = cum_resource[idx_end] - cum_resource[idx_start]
                 attributed = ak.where(mask_valid, vals, 0.0)
 
-            # Post-Process Output Mode
             final_values = attributed
-            
+
             if output_mode in ['rate', 'mean'] and metric is not None:
                 durations = r.ends - r.starts
                 safe_dur = ak.where(durations == 0, 1.0, durations)
@@ -451,7 +629,7 @@ class AttributionEngine:
                 stats = metric.get_statistics_vectorized(r.starts, r.ends)
                 if output_mode == 'min': final_values = stats['min']
                 if output_mode == 'max': final_values = stats['max']
-            
+
             res_data = {
                 'Start Time': r.starts,
                 'End Time': r.ends,
@@ -531,7 +709,7 @@ class Node:
         except Exception as e:
             print(f"Failed to derive metric '{name}' for node '{self.name}': {e}")
 
-    def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> ak.DataFrame:
+    def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> Any:
         """
         Attributes a specific metric to the ranks within this node.
         
@@ -541,11 +719,13 @@ class Node:
             **kwargs: Additional arguments passed to `AttributionEngine.compute`.
 
         Returns:
-            ak.DataFrame: Combined attribution results for all participating ranks.
+            Any: Combined attribution results for all participating ranks.
         """
         if metric_name not in self.metrics: return ak.DataFrame(dict())
         participating = topology_resolver(metric_name, self.ranks)
-        if not participating: return ak.DataFrame(dict())
+        if not participating:
+            print(f"Warning: Topology resolver for '{metric_name}' returned no ranks. Available ranks: {[r.name for r in self.ranks]}")
+            return ak.DataFrame(dict())
         
         res_dict = AttributionEngine.compute(self.metrics[metric_name], participating, **kwargs)
         
@@ -553,48 +733,52 @@ class Node:
         for r_name, df in res_dict.items():
             if df.size > 0:
                 nrows = df['Start Time'].size
-                df['Rank'] = ak.array([r_name] * nrows)
+                df['Rank'] = ak.array(np.full(nrows, r_name))
                 dfs.append(df)
-        
+
         if not dfs: return ak.DataFrame(dict())
-        
+
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
-            combined[k] = ak.concatenate([d[k] for d in dfs])
-        combined['Node'] = ak.array([self.name] * combined[keys[0]].size)
+            parts = [d[k] for d in dfs]
+            combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
+        nrows = next(v for v in combined.values() if v is not None).size
+        combined['Node'] = ak.array(np.full(nrows, self.name))
         return ak.DataFrame(combined)
 
-    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> ak.DataFrame:
+    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
         """
         Profiles the time spent in functions for this node.
-        
+
         Args:
             topology_resolver (Callable): Function to filter/resolve ranks. Default includes all.
             strategy (str): 'inclusive' or 'exclusive'.
-            
+
         Returns:
-            ak.DataFrame: Attributed time results.
+            Any: Attributed time results.
         """
         participating = topology_resolver("time", self.ranks)
         if not participating: return ak.DataFrame(dict())
-        
+
         res_dict = AttributionEngine.compute(None, participating, concurrency_mode='independent', strategy=strategy)
-        
+
         dfs = []
         for r_name, df in res_dict.items():
             if df.size > 0:
                 nrows = df['Start Time'].size
-                df['Rank'] = ak.array([r_name] * nrows)
+                df['Rank'] = ak.array(np.full(nrows, r_name))
                 dfs.append(df)
-        
+
         if not dfs: return ak.DataFrame(dict())
-        
+
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
-            combined[k] = ak.concatenate([d[k] for d in dfs])
-        combined['Node'] = ak.array([self.name] * combined[keys[0]].size)
+            parts = [d[k] for d in dfs]
+            combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
+        nrows = next(v for v in combined.values() if v is not None).size
+        combined['Node'] = ak.array(np.full(nrows, self.name))
         return ak.DataFrame(combined)
 
 class Run:
@@ -628,7 +812,7 @@ class Run:
         for node in self.nodes:
             node.add_derived_metric(name, func, *input_names)
 
-    def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> ak.DataFrame:
+    def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> Any:
         """
         Attributes a metric across all nodes in this run.
 
@@ -638,7 +822,7 @@ class Run:
             **kwargs: Arguments for attribution (strategy, mode, etc.).
 
         Returns:
-            ak.DataFrame: Combined attribution results with an added 'Run' column.
+            Any: Combined attribution results with an added 'Run' column.
         """
         dfs = [n.attribute(metric_name, topology_resolver, **kwargs) for n in self.nodes]
         dfs = [d for d in dfs if d.size > 0]
@@ -647,11 +831,13 @@ class Run:
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
-            combined[k] = ak.concatenate([d[k] for d in dfs])
-        combined['Run'] = ak.array([self.name] * combined[keys[0]].size)
+            parts = [d[k] for d in dfs]
+            combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
+        nrows = next(v for v in combined.values() if v is not None).size
+        combined['Run'] = ak.array(np.full(nrows, self.name))
         return ak.DataFrame(combined)
 
-    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> ak.DataFrame:
+    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
         """
         Profiles the time spent in functions across all nodes in this run.
 
@@ -660,17 +846,19 @@ class Run:
             strategy (str): 'inclusive' or 'exclusive'.
 
         Returns:
-            ak.DataFrame: Combined time attribution results.
+            Any: Combined time attribution results.
         """
         dfs = [n.time_profile(topology_resolver, strategy=strategy) for n in self.nodes]
         dfs = [d for d in dfs if d.size > 0]
         if not dfs: return ak.DataFrame(dict())
-        
+
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
-            combined[k] = ak.concatenate([d[k] for d in dfs])
-        combined['Run'] = ak.array([self.name] * combined[keys[0]].size)
+            parts = [d[k] for d in dfs]
+            combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
+        nrows = next(v for v in combined.values() if v is not None).size
+        combined['Run'] = ak.array(np.full(nrows, self.name))
         return ak.DataFrame(combined)
 
 # ==========================================
@@ -697,11 +885,11 @@ class Ensemble:
         Helper to filter dict/DataFrame columns manually.
         
         Args:
-            df_dict (Dict or ak.DataFrame): The dictionary or DataFrame to filter.
-            mask (ak.pdarray): Boolean mask for filtering.
+            df_dict (Dict or Any): The dictionary or DataFrame to filter.
+            mask (np.ndarray): Boolean mask for filtering.
 
         Returns:
-            ak.DataFrame: A new DataFrame with the filtered data.
+            Any: A new DataFrame with the filtered data.
         """
         new_dict = {}
         keys = df_dict.keys() if hasattr(df_dict, 'keys') else df_dict.columns
@@ -717,7 +905,7 @@ class Ensemble:
         return ak.DataFrame(new_dict)
 
     @staticmethod
-    def _get_valid_numeric_mask(arr: ak.pdarray) -> ak.pdarray:
+    def _get_valid_numeric_mask(arr: np.ndarray) -> np.ndarray:
         """
         Regex-based whitelist for numeric rows.
         Matches strict scientific notation or standard floats.
@@ -830,6 +1018,16 @@ class Ensemble:
                     if os.path.exists(c_path):
                         valid_c_paths.append(c_path)
                 
+                # Also discover additional callgraph files (e.g., HIP Context GPU traces)
+                try:
+                    for fname in os.listdir(abs_path):
+                        if fname.endswith("_callgraph.csv"):
+                            extra_path = os.path.join(abs_path, fname)
+                            if extra_path not in valid_c_paths:
+                                valid_c_paths.append(extra_path)
+                except OSError:
+                    pass
+                
                 loaded_ranks = []
                 if valid_c_paths:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -839,6 +1037,10 @@ class Ensemble:
                             path, result = future.result()
                             if isinstance(result, Exception):
                                 print(f"Error parse-loading callgraph {path}: {result}")
+                                continue
+                            
+                            # Skip empty data (header-only files with no data rows)
+                            if not result.get('Name'):
                                 continue
                             
                             # Transfer to Arkouda
@@ -865,7 +1067,16 @@ class Ensemble:
                                 # Here, we extract the rank ID from the Group column of the first row.
                                 group_val = result['Group'][0] if result['Group'] else "Unknown"
                                 
-                                loaded_ranks.append(Rank(node_name, group_val, c_df))
+                                # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
+                                # a unique rank name from the filename to avoid collisions
+                                # when multiple streams share the same Group value.
+                                basename = os.path.basename(path)
+                                if basename.startswith("MPI Rank"):
+                                    rank_name = group_val
+                                else:
+                                    rank_name = basename.rsplit('_callgraph', 1)[0]
+                                
+                                loaded_ranks.append(Rank(node_name, rank_name, c_df))
                                 
                             except Exception as e:
                                 print(f"Error transferring callgraph {path}: {e}")
@@ -891,7 +1102,7 @@ class Ensemble:
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver = lambda m, r: r, 
                   concurrency_mode: str = 'shared',
                   strategy: str = 'inclusive',
-                  output_mode: str = 'quantity') -> ak.DataFrame:
+                  output_mode: str = 'quantity') -> Any:
         """
         Performs metric attribution across the entire ensemble of runs.
 
@@ -903,11 +1114,12 @@ class Ensemble:
             output_mode (str): Output value format (quantity, rate, etc.).
 
         Returns:
-            ak.DataFrame: A concatenated DataFrame containing results from all runs.
+            Any: A concatenated DataFrame containing results from all runs.
         """
         
         dfs = []
-        print(f"Attributing '{metric_name}' on Arkouda Server...")
+        backend = get_backend()
+        print(f"Attributing '{metric_name}' ({'pandas' if backend == 'pandas' else 'Arkouda'} backend)...")
         for run in tqdm(self.runs):
             df = run.attribute(metric_name, topology_resolver, concurrency_mode=concurrency_mode, strategy=strategy, output_mode=output_mode)
             if df.size > 0: dfs.append(df)
@@ -918,10 +1130,11 @@ class Ensemble:
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
-            combined[k] = ak.concatenate([d[k] for d in dfs])
+            parts = [d[k] for d in dfs]
+            combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         return ak.DataFrame(combined)
 
-    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> ak.DataFrame:
+    def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
         """
         Profiles the time spent in functions across the entire ensemble of runs.
 
@@ -930,21 +1143,23 @@ class Ensemble:
             strategy (str): 'inclusive' or 'exclusive'.
 
         Returns:
-            ak.DataFrame: A concatenated DataFrame containing results from all runs.
+            Any: A concatenated DataFrame containing results from all runs.
         """
         dfs = []
-        print(f"Profiling time on Arkouda Server...")
+        backend = get_backend()
+        print(f"Profiling time ({'pandas' if backend == 'pandas' else 'Arkouda'} backend)...")
         for run in tqdm(self.runs):
             df = run.time_profile(topology_resolver, strategy=strategy)
             if df.size > 0: dfs.append(df)
-            
-        if not dfs: 
+
+        if not dfs:
             raise KeyError("No data found for time profiling. Check topology.")
-        
+
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
-            combined[k] = ak.concatenate([d[k] for d in dfs])
+            parts = [d[k] for d in dfs]
+            combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         return ak.DataFrame(combined)
 
 if __name__ == "__main__":
