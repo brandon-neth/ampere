@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <math.h>
 
 // Build: gcc -o trace_to_csv_serial trace_to_csv_serial.c -I/opt/otf2/include -L/opt/otf2/lib -lotf2
 
@@ -13,7 +14,7 @@ bool g_dedup = true; // Set via --dedup
 bool g_read_only = false; // Set via --read-only
 bool g_drop_hip = false; // Set via --drop-hip
 bool g_drop_mpi = false; // Set via --drop-mpi
-
+double g_duration_threshold = -INFINITY;
 
 // --- Helper Structs ---
 
@@ -42,6 +43,7 @@ typedef struct {
     char* group_name; 
     OTF2_LocationGroupRef group_id;
     
+    bool skip; 
     FILE* csv_cg;
     
     StackFrame* stack;
@@ -54,6 +56,7 @@ typedef struct {
     OTF2_LocationGroupRef id;
     char* name;
     
+    bool skip; 
     FILE* csv_met;
 
     // Cache for deduplication: Simple dynamic array
@@ -90,7 +93,6 @@ double get_time_seconds(uint64_t timestamp, ClockProperties* clk) {
     return (double)(timestamp - clk->globalOffset) / (double)clk->timerResolution;
 }
 
-// Simple lookup functions
 char* get_string(AppContext* ctx, OTF2_StringRef ref) {
     for(size_t i=0; i<ctx->n_strings; i++) if(ctx->strings[i].id == ref) return ctx->strings[i].str;
     return "Unknown";
@@ -117,28 +119,22 @@ bool values_equal(OTF2_Type type, OTF2_MetricValue v1, OTF2_MetricValue v2) {
     if (type == OTF2_TYPE_INT64) return v1.signed_int == v2.signed_int;
     if (type == OTF2_TYPE_UINT64) return v1.unsigned_int == v2.unsigned_int;
     if (type == OTF2_TYPE_DOUBLE) return v1.floating_point == v2.floating_point;
-    return false; // Default conservative
+    return false; 
 }
 
-// Returns true if we should SKIP writing (duplicate found)
 bool check_and_update_metric_cache(GroupState* grp, OTF2_MetricMemberRef member_id, OTF2_Type type, OTF2_MetricValue val) {
-    if (!g_dedup) return false; // Always write if dedup is off
+    if (!g_dedup) return false; 
 
-    // Linear search (usually few metrics per group)
     for (size_t i = 0; i < grp->n_metric_cache; i++) {
         if (grp->metric_cache[i].member_id == member_id) {
-            // Found existing entry
-            if (values_equal(type, grp->metric_cache[i].value, val)) {
-                return true; // Is Duplicate -> SKIP
-            } else {
-                // Different value -> Update and WRITE
+            if (values_equal(type, grp->metric_cache[i].value, val)) return true; 
+            else {
                 grp->metric_cache[i].value = val;
                 return false;
             }
         }
     }
 
-    // Not found -> Add new entry
     if (grp->n_metric_cache == grp->cap_metric_cache) {
         grp->cap_metric_cache = (grp->cap_metric_cache == 0) ? 8 : grp->cap_metric_cache * 2;
         grp->metric_cache = realloc(grp->metric_cache, grp->cap_metric_cache * sizeof(MetricLastValue));
@@ -148,7 +144,7 @@ bool check_and_update_metric_cache(GroupState* grp, OTF2_MetricMemberRef member_
     entry->type = type;
     entry->value = val;
     
-    return false; // First time seen -> WRITE
+    return false; 
 }
 
 // --- Definition Callbacks (Boilerplate) ---
@@ -181,6 +177,7 @@ OTF2_CallbackCode CbLocationGroup(void* userData, OTF2_LocationGroupRef self, OT
     GroupState* g = &ctx->groups[ctx->n_groups++];
     g->id = self;
     g->name = strdup(get_string(ctx, name));
+    g->skip = false;
     g->csv_met = NULL;
     g->metric_cache = NULL; g->n_metric_cache = 0; g->cap_metric_cache = 0;
     return OTF2_CALLBACK_SUCCESS;
@@ -197,9 +194,10 @@ OTF2_CallbackCode CbLocation(void* userData, OTF2_LocationRef self, OTF2_StringR
     l->name = strdup(get_string(ctx, name));
     l->group_id = group;
     l->group_name = NULL;
+    l->skip = false;
     l->csv_cg = NULL;
-    l->stack = malloc(1024 * sizeof(StackFrame));
-    l->stack_capacity = 1024;
+    l->stack = malloc(4096 * sizeof(StackFrame));
+    l->stack_capacity = 4096;
     l->stack_ptr = 0;
     return OTF2_CALLBACK_SUCCESS;
 }
@@ -249,7 +247,7 @@ OTF2_CallbackCode CbMetricInstance(void* userData, OTF2_MetricRef self, OTF2_Met
 OTF2_CallbackCode EvEnter(OTF2_LocationRef location, OTF2_TimeStamp time, void* userData, OTF2_AttributeList* attributes, OTF2_RegionRef region) {
     AppContext* ctx = (AppContext*)userData;
     LocationState* loc = get_location_state(ctx, location);
-    if (!loc) return OTF2_CALLBACK_SUCCESS;
+    if (!loc || loc->skip) return OTF2_CALLBACK_SUCCESS; 
 
     if (loc->stack_ptr == loc->stack_capacity) {
         loc->stack_capacity *= 2;
@@ -264,21 +262,18 @@ OTF2_CallbackCode EvEnter(OTF2_LocationRef location, OTF2_TimeStamp time, void* 
 OTF2_CallbackCode EvLeave(OTF2_LocationRef location, OTF2_TimeStamp time, void* userData, OTF2_AttributeList* attributes, OTF2_RegionRef region) {
     AppContext* ctx = (AppContext*)userData;
     LocationState* loc = get_location_state(ctx, location);
-    if (!loc || loc->stack_ptr == 0) return OTF2_CALLBACK_SUCCESS;
+    if (!loc || loc->skip || loc->stack_ptr == 0) return OTF2_CALLBACK_SUCCESS;
 
     loc->stack_ptr--;
     StackFrame frame = loc->stack[loc->stack_ptr];
     double start = get_time_seconds(frame.start_time, &ctx->clock);
     double end = get_time_seconds(time, &ctx->clock);
-    if (g_read_only) {
-        return OTF2_CALLBACK_SUCCESS; // Skip writing in read-only mode
-    }
-    if (g_drop_hip && strstr(frame.region_name, "hip")) {
-        return OTF2_CALLBACK_SUCCESS; // Skip HIP regions
-    }
-    if (g_drop_mpi && strstr(frame.region_name, "MPI")) {
-        return OTF2_CALLBACK_SUCCESS; // Skip MPI regions
-    }
+    
+    if (g_read_only) return OTF2_CALLBACK_SUCCESS; 
+    if (g_drop_hip && strstr(frame.region_name, "hip")) return OTF2_CALLBACK_SUCCESS; 
+    if (g_drop_mpi && strstr(frame.region_name, "MPI")) return OTF2_CALLBACK_SUCCESS; 
+    if (end-start < g_duration_threshold) return OTF2_CALLBACK_SUCCESS; 
+
     if (loc->csv_cg) {
         fprintf(loc->csv_cg, "%s,%s,%d,\"%s\",%.9f,%.9f,%.9f\n", 
                 loc->name, loc->group_name, loc->stack_ptr, frame.region_name, start, end, end-start);
@@ -291,9 +286,8 @@ OTF2_CallbackCode EvMetric(OTF2_LocationRef location, OTF2_TimeStamp time, void*
     LocationState* loc = get_location_state(ctx, location);
     if (!loc) return OTF2_CALLBACK_SUCCESS;
     GroupState* grp = get_group_state(ctx, loc->group_id);
-    if (!grp || !grp->csv_met) return OTF2_CALLBACK_SUCCESS;
+    if (!grp || grp->skip || !grp->csv_met) return OTF2_CALLBACK_SUCCESS;
 
-    // Resolve Class and Member ID
     OTF2_MetricRef classRef = metric;
     for(size_t i=0; i<ctx->n_minst; i++) {
         if (ctx->minst[i].id == metric) { classRef = ctx->minst[i].class_id; break; }
@@ -304,14 +298,9 @@ OTF2_CallbackCode EvMetric(OTF2_LocationRef location, OTF2_TimeStamp time, void*
         if (ctx->mclasses[i].id == classRef) { memberID = ctx->mclasses[i].member_id; break; }
     }
 
-    // CHECK DEDUPLICATION
-    if (check_and_update_metric_cache(grp, memberID, types[0], values[0])) {
-        return OTF2_CALLBACK_SUCCESS; // Skip writing
-    }
-    // If we are here, we write
-    if (g_read_only) {
-        return OTF2_CALLBACK_SUCCESS; // Skip writing in read-only mode
-    }
+    if (check_and_update_metric_cache(grp, memberID, types[0], values[0])) return OTF2_CALLBACK_SUCCESS; 
+    if (g_read_only) return OTF2_CALLBACK_SUCCESS; 
+    
     char* mName = "UnknownMetric";
     for(size_t j=0; j<ctx->n_members; j++) {
         if (ctx->members[j].id == memberID) { mName = ctx->members[j].name; break; }
@@ -333,32 +322,31 @@ OTF2_CallbackCode EvMetric(OTF2_LocationRef location, OTF2_TimeStamp time, void*
 
 int main(int argc, char** argv) {
     if (argc < 2) { 
-        printf("Usage: %s <trace.otf2> [--keep-dups] [--read-only] [--drop-hip] [--drop-mpi]\n", argv[0]); 
+        printf("Usage: %s <trace.otf2> [--help] [--keep-dups] [--read-only] [--drop-hip] [--drop-mpi]\n", argv[0]); 
         return 1; 
     }
     const char* tracePath = argv[1];
     
-    // Check flags
     for(int i=0; i<argc; i++) {
         if (strcmp(argv[i], "--keep-dups") == 0) g_dedup = false;
         else if (strcmp(argv[i], "--read-only") == 0) g_read_only = true;
         else if (strcmp(argv[i], "--drop-hip") == 0) g_drop_hip = true;
         else if (strcmp(argv[i], "--drop-mpi") == 0) g_drop_mpi = true;
-        else tracePath = argv[i]; // Last non-flag arg is trace path
+        else if (strcmp(argv[i], "--filter-duration") == 0) {
+            g_duration_threshold = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s <trace.otf2> [--keep-dups] [--read-only] [--drop-hip] [--drop-mpi]\n", argv[0]); 
+            exit(0);
+        }
+        else tracePath = argv[i]; 
     }
-    if (g_dedup) printf("Option enabled: Skipping consecutive duplicate metric values.\n");
-    if (g_read_only) printf("Option enabled: Read-only mode.\n");
-    if (g_drop_hip) printf("Option enabled: Dropping HIP regions from call graph.\n");
-    if (g_drop_mpi) printf("Option enabled: Dropping MPI regions from call graph.\n");
-    printf("Processing trace: %s\n", tracePath);
-    time_t start_time = time(NULL);
-
+    
     AppContext ctx = {0};
     OTF2_Reader* reader = OTF2_Reader_Open(tracePath);
     if (!reader) { fprintf(stderr, "Failed to open trace.\n"); return 1; }
     OTF2_Reader_SetSerialCollectiveCallbacks(reader);
 
-    // Setup Def Callbacks
     OTF2_GlobalDefReader* gdr = OTF2_Reader_GetGlobalDefReader(reader);
     OTF2_GlobalDefReaderCallbacks* gdcb = OTF2_GlobalDefReaderCallbacks_New();
     OTF2_GlobalDefReaderCallbacks_SetClockPropertiesCallback(gdcb, &CbClockProps);
@@ -374,43 +362,89 @@ int main(int argc, char** argv) {
     uint64_t dummy;
     OTF2_Reader_ReadAllGlobalDefinitions(reader, gdr, &dummy);
 
-    // Setup Files
+    // Setup Files: Groups (Metrics)
     for (size_t i = 0; i < ctx.n_groups; i++) {
+        int collision_count = 0;
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(ctx.groups[i].name, ctx.groups[j].name) == 0) {
+                collision_count++;
+            }
+        }
+        
+        // REGLA HÍBRIDA: Solo destruimos el hilo duplicado si pertenece a MPI
+        bool is_mpi = strstr(ctx.groups[i].name, "MPI") != NULL;
+        if (is_mpi && collision_count > 0) {
+            ctx.groups[i].skip = true;
+            continue;
+        }
+
         char filename[1024]; char cleanName[256]; 
         strncpy(cleanName, ctx.groups[i].name, 255); cleanName[255]=0;
-        sprintf(filename, "%s_metrics.csv", cleanName);
-        if (g_read_only) continue; // Skip creating files in read-only mode
+        
+        // Si no es MPI pero hay colisión, le agregamos un número para no corromper el CSV
+        if (collision_count > 0) {
+            sprintf(filename, "%s_%d_metrics.csv", cleanName, collision_count);
+        } else {
+            sprintf(filename, "%s_metrics.csv", cleanName);
+        }
+        
+        if (g_read_only) continue; 
+        
         ctx.groups[i].csv_met = fopen(filename, "w");
         if(ctx.groups[i].csv_met) fprintf(ctx.groups[i].csv_met, "Group,Metric Name,Time,Value\n");
     }
+    
+    // Setup Files: Locations (Callgraphs)
     for (size_t i = 0; i < ctx.n_locations; i++) {
         LocationState* loc = &ctx.locations[i];
         GroupState* grp = get_group_state(&ctx, loc->group_id);
         loc->group_name = grp ? grp->name : "Unknown";
         
+        int collision_count = 0;
+        for (size_t j = 0; j < i; j++) {
+            LocationState* prev = &ctx.locations[j];
+            if (prev->group_name && strcmp(loc->name, prev->name) == 0 && strcmp(loc->group_name, prev->group_name) == 0) {
+                collision_count++;
+            }
+        }
+
+        // REGLA HÍBRIDA: Solo destruimos la iteración si es MPI duplicado
+        bool is_mpi = (strstr(loc->name, "MPI") != NULL || strstr(loc->group_name, "MPI") != NULL);
+        if (is_mpi && collision_count > 0) {
+            loc->skip = true;
+            continue;
+        }
+
         char filename[1024]; char cleanL[256]; char cleanG[256];
         strncpy(cleanL, loc->name, 255); cleanL[255]=0;
         strncpy(cleanG, loc->group_name, 255); cleanG[255]=0;
         for(int c=0;cleanL[c];c++) if(cleanL[c]==' ') cleanL[c]='_';
         
-        sprintf(filename, "%s_%s_callgraph.csv", cleanG, cleanL);
+        // Si no es MPI y colisiona el nombre, agregamos el sufijo numérico para garantizar seguridad de lectura/escritura
+        if (collision_count > 0) {
+            sprintf(filename, "%s_%s_%d_callgraph.csv", cleanG, cleanL, collision_count);
+        } else {
+            sprintf(filename, "%s_%s_callgraph.csv", cleanG, cleanL);
+        }
+        
         OTF2_Reader_SelectLocation(reader, loc->id);
-        if (g_read_only) continue; // Skip creating files in read-only mode
+        if (g_read_only) continue; 
+
         loc->csv_cg = fopen(filename, "w");
         if(loc->csv_cg) fprintf(loc->csv_cg, "Thread,Group,Depth,Name,Start Time,End Time,Duration\n");
     }
 
     OTF2_Reader_OpenDefFiles(reader);
     OTF2_Reader_OpenEvtFiles(reader);
-    for (size_t i = 0; i < ctx.n_locations; i++) { // Clear local defs
+    for (size_t i = 0; i < ctx.n_locations; i++) { 
+        if (ctx.locations[i].skip) continue; 
+        
         OTF2_DefReader* dr = OTF2_Reader_GetDefReader(reader, ctx.locations[i].id);
         if (dr) { OTF2_Reader_ReadAllLocalDefinitions(reader, dr, &dummy); OTF2_Reader_CloseDefReader(reader, dr); }
         OTF2_Reader_GetEvtReader(reader, ctx.locations[i].id); 
     }
     OTF2_Reader_CloseDefFiles(reader);
 
-    // Read Events
-    printf("Processing events...\n");
     OTF2_GlobalEvtReader* ger = OTF2_Reader_GetGlobalEvtReader(reader);
     OTF2_GlobalEvtReaderCallbacks* ecb = OTF2_GlobalEvtReaderCallbacks_New();
     OTF2_GlobalEvtReaderCallbacks_SetEnterCallback(ecb, &EvEnter);
@@ -420,7 +454,7 @@ int main(int argc, char** argv) {
     OTF2_GlobalEvtReaderCallbacks_Delete(ecb);
     OTF2_Reader_ReadAllGlobalEvents(reader, ger, &dummy);
 
-    // Clean
+    // Clean up
     for(size_t i=0; i<ctx.n_groups; i++) {
         if(ctx.groups[i].csv_met) fclose(ctx.groups[i].csv_met);
         free(ctx.groups[i].metric_cache);
@@ -429,16 +463,10 @@ int main(int argc, char** argv) {
         if(ctx.locations[i].csv_cg) fclose(ctx.locations[i].csv_cg);
         free(ctx.locations[i].stack);
     }
+    
     OTF2_Reader_CloseGlobalEvtReader(reader, ger);
     OTF2_Reader_CloseEvtFiles(reader);
     OTF2_Reader_Close(reader);
 
-    time_t end_time = time(NULL);
-    double elapsed = difftime(end_time, start_time);
-    if (g_read_only) {
-        printf("Reading completed in %f seconds.\n", elapsed);
-    } else {
-        printf("CSV conversion completed in %f seconds.\n", elapsed);
-    }
     return 0;
 }
