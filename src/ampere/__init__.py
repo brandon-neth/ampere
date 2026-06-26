@@ -935,6 +935,130 @@ class Ensemble:
             if isinstance(k, str) and k.startswith('^') and re.match(k, name): return v
         return MetricConfig(kind=MetricType.INSTANTANEOUS)
 
+
+    @staticmethod
+    def from_trace_paths_parquet(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}) -> 'Ensemble':
+        """
+        Loads multiple trace runs in parallel and constructs an Ensemble.
+        
+        Uses a thread pool to parse client-side Parquet files efficiently before transferring 
+        data to the Arkouda server. This optimization avoids slow sequential server-side parsing.
+
+        Args:
+            trace_paths (List[str]): List of file paths to trace directories.
+            node_ranks (Dict): Dictionary mapping Node names to lists of Rank IDs (e.g., {"Node1": ["Rank0", "Rank1"]}).
+            metric_configs (Dict): Dictionary mapping metric naming patterns to `MetricConfig` objects.
+
+        """
+        runs = []
+        print("Starting to load runs...")
+        for path in tqdm(trace_paths, desc="Loading Runs"):
+            abs_path = os.path.abspath(path)
+            nodes = []
+            for node_name, ranks in node_ranks.items():
+                # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
+                # Metric loading (Keep sequential as it's small and lacks ID)
+                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
+                metrics = []
+                if os.path.exists(m_path):
+                    print("Reading metrics from:", m_path)
+                    try:
+                        m_df = ak.read_parquet(m_path)
+                        if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
+                            m_names = m_df['Metric Name']
+                            g = ak.GroupBy(m_names)
+                            uk, _ = g.aggregate(m_names, 'first')
+                            unique_metrics = uk.to_ndarray().tolist()
+                            
+                            for m_name in unique_metrics:
+                                mask = (m_names == m_name)
+                                times = m_df['Time'][mask]
+                                values = m_df['Value'][mask]
+                                if times.dtype != ak.float64: times = ak.cast(times, ak.float64)
+                                if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
+                                cfg = Ensemble._resolve_config(m_name, metric_configs)
+                                metrics.append(Metric(m_name, times, values, cfg))
+                    except Exception as e:
+                        print(f"Error loading metrics {m_path}: {e}")
+                    print("Done with metrics from ", m_path)
+        
+                valid_c_paths = []
+                for r_id in ranks:
+                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.parquet")
+                    if os.path.exists(c_path):
+                        valid_c_paths.append(c_path)
+                
+                # Also discover additional callgraph files (e.g., HIP Context GPU traces)
+                try:
+                    for fname in os.listdir(abs_path):
+                        if fname.endswith("_callgraph.parquet"):
+                            extra_path = os.path.join(abs_path, fname)
+                            if extra_path not in valid_c_paths:
+                                valid_c_paths.append(extra_path)
+                except OSError:
+                    pass
+
+                if not valid_c_paths:
+                    print(f"Warning: No valid callgraph files found for node '{node_name}' in path '{abs_path}'.")
+                    continue
+                
+                loaded_ranks = []
+                for valid_path in valid_c_paths:
+                    print("Reading callgraph from ", valid_path)
+                    data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
+                    
+                    try:    
+                        
+                        df = ak.read_parquet(valid_path)
+
+                        data['Group'] = df['group']
+                        data['Depth'] = df['depth']
+                        data['Name'] = df['name']
+                        data['Start Time'] = df['start_time']
+                        data['End Time'] = df['end_time']
+                        if 'duration' in df:
+                            data['Duration'] = df['duration']
+                        else:
+                            data['Duration'] = df['end_time'] - df['start_time']
+                        if 'metadata' in df:
+                            data['Metadata'] = df['metadata']
+                        else:
+                            data['Metadata'] = ak.full(df['name'].size, "")
+                    except Exception as e:
+                        print(f"Error loading callgraph {valid_path}: {e}")
+
+                    # Skip empty data (header-only files with no data rows)
+                    if not data.get('Name'):
+                        print(f"Warning: Callgraph file {valid_path} is empty or has no valid data. Skipping.")
+                        continue
+
+                    c_df = ak.DataFrame(data)
+                    
+                    # Filter: End > Start
+                    mask = c_df['End Time'] > c_df['Start Time']
+                    c_df = Ensemble._apply_filter_to_dict(c_df, mask)
+                    
+                    # Identify Rank ID from path or group
+                    # We first check the Group column, which is reliable if consistent.
+                    # Alternatively, we could assume the filename maps to a rank ID as iterated in the loop.
+                    # Here, we extract the rank ID from the Group column of the first row.
+                    group_val = data['Group'][0] if data['Group'] else "Unknown"
+                    
+                    # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
+                    # a unique rank name from the filename to avoid collisions
+                    # when multiple streams share the same Group value.
+                    basename = os.path.basename(path)
+                    if basename.startswith("MPI Rank"):
+                        rank_name = group_val
+                    else:
+                        rank_name = basename.rsplit('_callgraph', 1)[0]
+                    
+                    loaded_ranks.append(Rank(node_name, rank_name, c_df))
+                if loaded_ranks:
+                    nodes.append(Node(node_name, metrics, loaded_ranks))
+            if nodes: runs.append(Run(abs_path, nodes))
+        return Ensemble(runs)
+
     @staticmethod
     def from_trace_paths(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}, max_workers: int = 32) -> 'Ensemble':
         """
@@ -953,17 +1077,19 @@ class Ensemble:
             Ensemble: An Ensemble object containing the loaded Runs.
         """
         runs = []
+        print("Starting to load runs...")
         for path in tqdm(trace_paths, desc="Loading Runs"):
             abs_path = os.path.abspath(path)
             nodes = []
             for node_name, ranks in node_ranks.items():
                 # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
                 # Metric loading (Keep sequential as it's small and lacks ID)
-                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.csv")
+                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
                 metrics = []
                 if os.path.exists(m_path):
+                    print("Reading metrics from:", m_path)
                     try:
-                        m_df = ak.read_csv(m_path, column_delim=',')
+                        m_df = ak.read_parquet(m_path)
                         if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
                             m_names = m_df['Metric Name']
                             g = ak.GroupBy(m_names)
@@ -980,7 +1106,7 @@ class Ensemble:
                                 metrics.append(Metric(m_name, times, values, cfg))
                     except Exception as e:
                         print(f"Error loading metrics {m_path}: {e}")
-
+                    print("Done with metrics from ", m_path)
                 # Callgraph loading - PARALLEL CLIENT OPTIMIZATION
                 # We use ThreadPoolExecutor to parse CSVs on client (fast) and transfer to Arkouda.
                 # This bypasses the slow sequential server-side read_csv.
@@ -989,39 +1115,38 @@ class Ensemble:
                 def parse_callgraph_client(path):
                     try:
                         data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
-                        with open(path, 'r') as f:
-                            reader = csv.reader(f, delimiter=',')
-                            header = next(reader, None) # Skip header
-                            for row in reader:
-                                if len(row) < 7: continue # Skip malformed lines
-                                # Indices: 0:Thread, 1:Group, 2:Depth, 3:Name, 4:Start, 5:End, 6:Duration
-                                data['Group'].append(row[1])
-                                data['Depth'].append(int(row[2]))
-                                data['Name'].append(row[3])
-                                data['Start Time'].append(float(row[4]))
-                                data['End Time'].append(float(row[5]))
-                                if len(row) > 6:
-                                    data['Duration'].append(float(row[6]))
-                                else:
-                                    data['Duration'].append(float(row[5]) - float(row[4]))
-                                if len(row) > 7:
-                                    data['Metadata'].append(row[7])
-                                else:
-                                    data['Metadata'].append('')
+                        print("Reading callgraph from:", path, ' ...')
+                        df = ak.read_parquet(path)
+                        print(f"Parsing callgraph {path} from {df}")
+                        for i in range(len(df)):
+                            print(f"Processing line {i} from {path}")
+                            data['Group'].append(df['group'][i])
+                            data['Depth'].append(int(df['depth'][i]))
+                            data['Name'].append(df['name'][i])
+                            data['Start Time'].append(float(df['start_time'][i]))
+                            data['End Time'].append(float(df['end_time'][i]))
+                            if 'duration' in df:
+                                data['Duration'].append(float(df['duration'][i]))
+                            else:
+                                data['Duration'].append(float(df['end_time'][i]) - float(df['start_time'][i]))
+                            if 'metadata' in df:
+                                data['Metadata'].append(df['metadata'][i])
+                            else:
+                                data['Metadata'].append('')
                         return (path, data)
                     except Exception as e:
                         return (path, e)
 
                 valid_c_paths = []
                 for r_id in ranks:
-                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.csv")
+                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.parquet")
                     if os.path.exists(c_path):
                         valid_c_paths.append(c_path)
                 
                 # Also discover additional callgraph files (e.g., HIP Context GPU traces)
                 try:
                     for fname in os.listdir(abs_path):
-                        if fname.endswith("_callgraph.csv"):
+                        if fname.endswith("_callgraph.parquet"):
                             extra_path = os.path.join(abs_path, fname)
                             if extra_path not in valid_c_paths:
                                 valid_c_paths.append(extra_path)
@@ -1045,18 +1170,30 @@ class Ensemble:
                             
                             # Transfer to Arkouda
                             try:
+                                print("Create dict of arrays...")
                                 # Create dict of arrays
                                 ak_dict = {}
+                                print("Depth")
+                                depth = result['Depth']
+                                print(type(depth), len(depth))
+                                depth_array = ak.array(depth)
+                                print("Created depth_array")
                                 ak_dict['Depth'] = ak.array(result['Depth'])
+                                print("Start Time")
                                 ak_dict['Start Time'] = ak.array(result['Start Time'])
+                                print("End Time")
                                 ak_dict['End Time'] = ak.array(result['End Time'])
+                                print("Duration")
                                 ak_dict['Duration'] = ak.array(result['Duration'])
+                                print("Name")
                                 ak_dict['Name'] = ak.array(result['Name'])
                                 ak_dict['Group'] = ak.array(result['Group'])
+                                print("Metadata")
                                 ak_dict['Metadata'] = ak.array(result['Metadata'])
                                 
                                 c_df = ak.DataFrame(ak_dict)
                                 
+                                print("Filtering...")
                                 # Filter: End > Start
                                 mask = c_df['End Time'] > c_df['Start Time']
                                 c_df = Ensemble._apply_filter_to_dict(c_df, mask)
@@ -1067,6 +1204,7 @@ class Ensemble:
                                 # Here, we extract the rank ID from the Group column of the first row.
                                 group_val = result['Group'][0] if result['Group'] else "Unknown"
                                 
+                                print("Deriving unique rank name...")
                                 # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
                                 # a unique rank name from the filename to avoid collisions
                                 # when multiple streams share the same Group value.
