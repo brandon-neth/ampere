@@ -532,6 +532,7 @@ class AttributionEngine:
         # ---- Arkouda backend: original pipeline ----
 
         # 1. Global Timeline
+        print(f"Attribution Engine Step 1: Global Timeline...")
         time_arrays = []
         if metric is not None:
             time_arrays.append(metric.times)
@@ -560,6 +561,7 @@ class AttributionEngine:
             deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
         else:
             deltas = breaks[1:] - breaks[:-1]
+
 
         rank_coverages = []
         if concurrency_mode == 'shared':
@@ -721,30 +723,39 @@ class Node:
         Returns:
             Any: Combined attribution results for all participating ranks.
         """
-        if metric_name not in self.metrics: return ak.DataFrame(dict())
+        print(f"Attributing metric '{metric_name}' for node '{self.name}' with {len(self.ranks)} ranks.")
+        print(f'Ranks:')
+        for r in self.ranks:
+            print(f'  Node: {r.node}, Name: {r.name}')
+        if metric_name not in self.metrics: 
+            print(f'Did not find metric "{metric_name}" in node "{self.name}". Available metrics: {list(self.metrics.keys())}')
+            return ak.DataFrame(dict())
         participating = topology_resolver(metric_name, self.ranks)
+        print(f'topology_resolver("{metric_name}", ranks): {topology_resolver(metric_name, self.ranks)}')
         if not participating:
             print(f"Warning: Topology resolver for '{metric_name}' returned no ranks. Available ranks: {[r.name for r in self.ranks]}")
             return ak.DataFrame(dict())
         
+        print("Running AttributionEngine.compute...")
         res_dict = AttributionEngine.compute(self.metrics[metric_name], participating, **kwargs)
         
+        print(f"Creating DataFrames...")
         dfs = []
         for r_name, df in res_dict.items():
             if df.size > 0:
                 nrows = df['Start Time'].size
-                df['Rank'] = ak.array(np.full(nrows, r_name))
+                df['Rank'] = ak.full(nrows, r_name)
                 dfs.append(df)
 
         if not dfs: return ak.DataFrame(dict())
-
+        print(f"Combining DataFrames for node '{self.name}'...")
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Node'] = ak.array(np.full(nrows, self.name))
+        combined['Node'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
     def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
@@ -767,7 +778,7 @@ class Node:
         for r_name, df in res_dict.items():
             if df.size > 0:
                 nrows = df['Start Time'].size
-                df['Rank'] = ak.array(np.full(nrows, r_name))
+                df['Rank'] = ak.full(nrows, r_name)
                 dfs.append(df)
 
         if not dfs: return ak.DataFrame(dict())
@@ -778,7 +789,7 @@ class Node:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Node'] = ak.array(np.full(nrows, self.name))
+        combined['Node'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
 class Run:
@@ -825,6 +836,7 @@ class Run:
             Any: Combined attribution results with an added 'Run' column.
         """
         dfs = [n.attribute(metric_name, topology_resolver, **kwargs) for n in self.nodes]
+        print("Done creating node-level attribution DataFrames")
         dfs = [d for d in dfs if d.size > 0]
         if not dfs: return ak.DataFrame(dict())
         
@@ -834,7 +846,7 @@ class Run:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Run'] = ak.array(np.full(nrows, self.name))
+        combined['Run'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
     def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
@@ -858,7 +870,7 @@ class Run:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Run'] = ak.array(np.full(nrows, self.name))
+        combined['Run'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
 # ==========================================
@@ -956,6 +968,7 @@ class Ensemble:
             abs_path = os.path.abspath(path)
             nodes = []
             for node_name, ranks in node_ranks.items():
+                print("Processing node:", node_name, "with ranks:", ranks)
                 # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
                 # Metric loading (Keep sequential as it's small and lacks ID)
                 m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
@@ -964,20 +977,23 @@ class Ensemble:
                     print("Reading metrics from:", m_path)
                     try:
                         m_df = ak.read_parquet(m_path)
-                        if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
-                            m_names = m_df['Metric Name']
+                        print("metrics file columns: ", m_df.keys())
+                        if 'metric_name' in m_df and 'time' in m_df and 'value_int' in m_df:
+                            m_names = m_df['metric_name']
                             g = ak.GroupBy(m_names)
                             uk, _ = g.aggregate(m_names, 'first')
                             unique_metrics = uk.to_ndarray().tolist()
                             
                             for m_name in unique_metrics:
                                 mask = (m_names == m_name)
-                                times = m_df['Time'][mask]
-                                values = m_df['Value'][mask]
+                                times = m_df['time'][mask]
+                                values = m_df['value_int'][mask]
                                 if times.dtype != ak.float64: times = ak.cast(times, ak.float64)
                                 if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
                                 cfg = Ensemble._resolve_config(m_name, metric_configs)
                                 metrics.append(Metric(m_name, times, values, cfg))
+                        else:
+                            print(f"Warning: Metrics file {m_path} is missing required columns. Skipping metrics for node '{node_name}'.")
                     except Exception as e:
                         print(f"Error loading metrics {m_path}: {e}")
                     print("Done with metrics from ", m_path)
@@ -993,8 +1009,11 @@ class Ensemble:
                     for fname in os.listdir(abs_path):
                         if fname.endswith("_callgraph.parquet"):
                             extra_path = os.path.join(abs_path, fname)
-                            if extra_path not in valid_c_paths:
-                                valid_c_paths.append(extra_path)
+                            if extra_path in valid_c_paths:
+                                continue
+                            if 'MPI Rank ' in fname:
+                                continue
+                            valid_c_paths.append(extra_path)
                 except OSError:
                     pass
 
@@ -1043,16 +1062,15 @@ class Ensemble:
                     # Alternatively, we could assume the filename maps to a rank ID as iterated in the loop.
                     # Here, we extract the rank ID from the Group column of the first row.
                     group_val = data['Group'][0] if data['Group'] else "Unknown"
-                    
+                    print(f"Group value for callgraph {valid_path}: {group_val}")
                     # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
                     # a unique rank name from the filename to avoid collisions
                     # when multiple streams share the same Group value.
-                    basename = os.path.basename(path)
+                    basename = os.path.basename(valid_path)
                     if basename.startswith("MPI Rank"):
                         rank_name = group_val
                     else:
                         rank_name = basename.rsplit('_callgraph', 1)[0]
-                    
                     loaded_ranks.append(Rank(node_name, rank_name, c_df))
                 if loaded_ranks:
                     nodes.append(Node(node_name, metrics, loaded_ranks))
