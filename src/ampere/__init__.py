@@ -532,7 +532,6 @@ class AttributionEngine:
         # ---- Arkouda backend: original pipeline ----
 
         # 1. Global Timeline
-        print(f"Attribution Engine Step 1: Global Timeline...")
         time_arrays = []
         if metric is not None:
             time_arrays.append(metric.times)
@@ -723,23 +722,16 @@ class Node:
         Returns:
             Any: Combined attribution results for all participating ranks.
         """
-        print(f"Attributing metric '{metric_name}' for node '{self.name}' with {len(self.ranks)} ranks.")
-        print(f'Ranks:')
-        for r in self.ranks:
-            print(f'  Node: {r.node}, Name: {r.name}')
         if metric_name not in self.metrics: 
             print(f'Did not find metric "{metric_name}" in node "{self.name}". Available metrics: {list(self.metrics.keys())}')
             return ak.DataFrame(dict())
         participating = topology_resolver(metric_name, self.ranks)
-        print(f'topology_resolver("{metric_name}", ranks): {topology_resolver(metric_name, self.ranks)}')
         if not participating:
             print(f"Warning: Topology resolver for '{metric_name}' returned no ranks. Available ranks: {[r.name for r in self.ranks]}")
             return ak.DataFrame(dict())
         
-        print("Running AttributionEngine.compute...")
         res_dict = AttributionEngine.compute(self.metrics[metric_name], participating, **kwargs)
         
-        print(f"Creating DataFrames...")
         dfs = []
         for r_name, df in res_dict.items():
             if df.size > 0:
@@ -748,7 +740,7 @@ class Node:
                 dfs.append(df)
 
         if not dfs: return ak.DataFrame(dict())
-        print(f"Combining DataFrames for node '{self.name}'...")
+
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}
         for k in keys:
@@ -836,7 +828,6 @@ class Run:
             Any: Combined attribution results with an added 'Run' column.
         """
         dfs = [n.attribute(metric_name, topology_resolver, **kwargs) for n in self.nodes]
-        print("Done creating node-level attribution DataFrames")
         dfs = [d for d in dfs if d.size > 0]
         if not dfs: return ak.DataFrame(dict())
         
@@ -963,21 +954,17 @@ class Ensemble:
 
         """
         runs = []
-        print("Starting to load runs...")
         for path in tqdm(trace_paths, desc="Loading Runs"):
             abs_path = os.path.abspath(path)
             nodes = []
             for node_name, ranks in node_ranks.items():
-                print("Processing node:", node_name, "with ranks:", ranks)
                 # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
                 # Metric loading (Keep sequential as it's small and lacks ID)
                 m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
                 metrics = []
                 if os.path.exists(m_path):
-                    print("Reading metrics from:", m_path)
                     try:
                         m_df = ak.read_parquet(m_path)
-                        print("metrics file columns: ", m_df.keys())
                         if 'metric_name' in m_df and 'time' in m_df and 'value_int' in m_df:
                             m_names = m_df['metric_name']
                             g = ak.GroupBy(m_names)
@@ -996,7 +983,6 @@ class Ensemble:
                             print(f"Warning: Metrics file {m_path} is missing required columns. Skipping metrics for node '{node_name}'.")
                     except Exception as e:
                         print(f"Error loading metrics {m_path}: {e}")
-                    print("Done with metrics from ", m_path)
         
                 valid_c_paths = []
                 for r_id in ranks:
@@ -1023,7 +1009,6 @@ class Ensemble:
                 
                 loaded_ranks = []
                 for valid_path in valid_c_paths:
-                    print("Reading callgraph from ", valid_path)
                     data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
                     
                     try:    
@@ -1062,7 +1047,7 @@ class Ensemble:
                     # Alternatively, we could assume the filename maps to a rank ID as iterated in the loop.
                     # Here, we extract the rank ID from the Group column of the first row.
                     group_val = data['Group'][0] if data['Group'] else "Unknown"
-                    print(f"Group value for callgraph {valid_path}: {group_val}")
+
                     # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
                     # a unique rank name from the filename to avoid collisions
                     # when multiple streams share the same Group value.
@@ -1095,7 +1080,6 @@ class Ensemble:
             Ensemble: An Ensemble object containing the loaded Runs.
         """
         runs = []
-        print("Starting to load runs...")
         for path in tqdm(trace_paths, desc="Loading Runs"):
             abs_path = os.path.abspath(path)
             nodes = []
@@ -1105,7 +1089,6 @@ class Ensemble:
                 m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
                 metrics = []
                 if os.path.exists(m_path):
-                    print("Reading metrics from:", m_path)
                     try:
                         m_df = ak.read_parquet(m_path)
                         if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
@@ -1124,7 +1107,7 @@ class Ensemble:
                                 metrics.append(Metric(m_name, times, values, cfg))
                     except Exception as e:
                         print(f"Error loading metrics {m_path}: {e}")
-                    print("Done with metrics from ", m_path)
+
                 # Callgraph loading - PARALLEL CLIENT OPTIMIZATION
                 # We use ThreadPoolExecutor to parse CSVs on client (fast) and transfer to Arkouda.
                 # This bypasses the slow sequential server-side read_csv.
@@ -1133,11 +1116,8 @@ class Ensemble:
                 def parse_callgraph_client(path):
                     try:
                         data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
-                        print("Reading callgraph from:", path, ' ...')
                         df = ak.read_parquet(path)
-                        print(f"Parsing callgraph {path} from {df}")
                         for i in range(len(df)):
-                            print(f"Processing line {i} from {path}")
                             data['Group'].append(df['group'][i])
                             data['Depth'].append(int(df['depth'][i]))
                             data['Name'].append(df['name'][i])
@@ -1188,30 +1168,20 @@ class Ensemble:
                             
                             # Transfer to Arkouda
                             try:
-                                print("Create dict of arrays...")
                                 # Create dict of arrays
                                 ak_dict = {}
-                                print("Depth")
                                 depth = result['Depth']
-                                print(type(depth), len(depth))
                                 depth_array = ak.array(depth)
-                                print("Created depth_array")
                                 ak_dict['Depth'] = ak.array(result['Depth'])
-                                print("Start Time")
                                 ak_dict['Start Time'] = ak.array(result['Start Time'])
-                                print("End Time")
                                 ak_dict['End Time'] = ak.array(result['End Time'])
-                                print("Duration")
                                 ak_dict['Duration'] = ak.array(result['Duration'])
-                                print("Name")
                                 ak_dict['Name'] = ak.array(result['Name'])
                                 ak_dict['Group'] = ak.array(result['Group'])
-                                print("Metadata")
                                 ak_dict['Metadata'] = ak.array(result['Metadata'])
                                 
                                 c_df = ak.DataFrame(ak_dict)
                                 
-                                print("Filtering...")
                                 # Filter: End > Start
                                 mask = c_df['End Time'] > c_df['Start Time']
                                 c_df = Ensemble._apply_filter_to_dict(c_df, mask)
@@ -1222,7 +1192,6 @@ class Ensemble:
                                 # Here, we extract the rank ID from the Group column of the first row.
                                 group_val = result['Group'][0] if result['Group'] else "Unknown"
                                 
-                                print("Deriving unique rank name...")
                                 # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
                                 # a unique rank name from the filename to avoid collisions
                                 # when multiple streams share the same Group value.
