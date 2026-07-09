@@ -942,10 +942,8 @@ class Ensemble:
     @staticmethod
     def from_trace_paths_parquet(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}) -> 'Ensemble':
         """
-        Loads multiple trace runs in parallel and constructs an Ensemble.
-        
-        Uses a thread pool to parse client-side Parquet files efficiently before transferring 
-        data to the Arkouda server. This optimization avoids slow sequential server-side parsing.
+        Loads multiple trace runs in parallel and constructs an Ensemble from traces stored in Parquet format.
+
 
         Args:
             trace_paths (List[str]): List of file paths to trace directories.
@@ -1062,7 +1060,6 @@ class Ensemble:
             if nodes: runs.append(Run(abs_path, nodes))
         return Ensemble(runs)
 
-    @staticmethod
     def from_trace_paths(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}, max_workers: int = 32) -> 'Ensemble':
         """
         Loads multiple trace runs in parallel and constructs an Ensemble.
@@ -1086,11 +1083,11 @@ class Ensemble:
             for node_name, ranks in node_ranks.items():
                 # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
                 # Metric loading (Keep sequential as it's small and lacks ID)
-                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
+                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.csv")
                 metrics = []
                 if os.path.exists(m_path):
                     try:
-                        m_df = ak.read_parquet(m_path)
+                        m_df = ak.read_csv(m_path, column_delim=',')
                         if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
                             m_names = m_df['Metric Name']
                             g = ak.GroupBy(m_names)
@@ -1116,35 +1113,39 @@ class Ensemble:
                 def parse_callgraph_client(path):
                     try:
                         data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
-                        df = ak.read_parquet(path)
-                        for i in range(len(df)):
-                            data['Group'].append(df['group'][i])
-                            data['Depth'].append(int(df['depth'][i]))
-                            data['Name'].append(df['name'][i])
-                            data['Start Time'].append(float(df['start_time'][i]))
-                            data['End Time'].append(float(df['end_time'][i]))
-                            if 'duration' in df:
-                                data['Duration'].append(float(df['duration'][i]))
-                            else:
-                                data['Duration'].append(float(df['end_time'][i]) - float(df['start_time'][i]))
-                            if 'metadata' in df:
-                                data['Metadata'].append(df['metadata'][i])
-                            else:
-                                data['Metadata'].append('')
+                        with open(path, 'r') as f:
+                            reader = csv.reader(f, delimiter=',')
+                            header = next(reader, None) # Skip header
+                            for row in reader:
+                                if len(row) < 7: continue # Skip malformed lines
+                                # Indices: 0:Thread, 1:Group, 2:Depth, 3:Name, 4:Start, 5:End, 6:Duration
+                                data['Group'].append(row[1])
+                                data['Depth'].append(int(row[2]))
+                                data['Name'].append(row[3])
+                                data['Start Time'].append(float(row[4]))
+                                data['End Time'].append(float(row[5]))
+                                if len(row) > 6:
+                                    data['Duration'].append(float(row[6]))
+                                else:
+                                    data['Duration'].append(float(row[5]) - float(row[4]))
+                                if len(row) > 7:
+                                    data['Metadata'].append(row[7])
+                                else:
+                                    data['Metadata'].append('')
                         return (path, data)
                     except Exception as e:
                         return (path, e)
 
                 valid_c_paths = []
                 for r_id in ranks:
-                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.parquet")
+                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.csv")
                     if os.path.exists(c_path):
                         valid_c_paths.append(c_path)
                 
                 # Also discover additional callgraph files (e.g., HIP Context GPU traces)
                 try:
                     for fname in os.listdir(abs_path):
-                        if fname.endswith("_callgraph.parquet"):
+                        if fname.endswith("_callgraph.csv"):
                             extra_path = os.path.join(abs_path, fname)
                             if extra_path not in valid_c_paths:
                                 valid_c_paths.append(extra_path)
@@ -1170,8 +1171,6 @@ class Ensemble:
                             try:
                                 # Create dict of arrays
                                 ak_dict = {}
-                                depth = result['Depth']
-                                depth_array = ak.array(depth)
                                 ak_dict['Depth'] = ak.array(result['Depth'])
                                 ak_dict['Start Time'] = ak.array(result['Start Time'])
                                 ak_dict['End Time'] = ak.array(result['End Time'])
@@ -1210,7 +1209,7 @@ class Ensemble:
                     nodes.append(Node(node_name, metrics, loaded_ranks))
             if nodes: runs.append(Run(abs_path, nodes))
         return Ensemble(runs)
-        
+    
     def add_derived_metric(self, name: str, func: Callable[..., Metric], *input_names: str):
         """
         Adds a derived metric to all runs in the ensemble.
