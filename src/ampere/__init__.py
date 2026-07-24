@@ -120,7 +120,12 @@ def ak_interp1d(x: np.ndarray, y: np.ndarray, xi: np.ndarray, kind: str = 'linea
 class Metric:
     """
     Represents a time-series metric with associated values and configuration.
-    
+
+    All Arkouda server work is **deferred** until a field is first accessed
+    (lazy construction — see possible_optimizations.md Plan A).  Only
+    ``name``, ``kind``, and ``interp_kind`` are computed eagerly because they
+    are pure-Python and cost nothing.
+
     Attributes:
         name (str): The name of the metric.
         times (np.ndarray): Array of monotonically increasing timestamps (float64).
@@ -131,40 +136,94 @@ class Metric:
     def __init__(self, name: str, times: np.ndarray, values: np.ndarray, config: MetricConfig):
         self.name = name
         self.kind = config.kind
-        
-        # Validate and cast inputs to Float64
-        if times.dtype != ak.float64: times = ak.cast(times, ak.float64)
-        if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
 
-        # 1. Sort
-        perm = ak.argsort(times)
-        self.times = times[perm]
-        self.raw_values = values[perm] * config.scale_factor
-        
-        self.t_min = self.times[0]
-        self.t_max = self.times[-1]
+        # interp_kind is pure-Python — compute it eagerly at zero cost.
         self.interp_kind = config.interpolation_kind
         if self.kind == MetricType.INSTANTANEOUS and self.interp_kind == 'linear':
             self.interp_kind = 'previous'
 
-        # 2. Integrate
+        # Store raw inputs without touching Arkouda.  All server-side work is
+        # deferred to _ensure_sorted / _ensure_integrated, which are called on
+        # first access of the corresponding properties.
+        self._config        = config
+        self._input_times   = times
+        self._input_values  = values
+
+        # Lazy-computed backing fields (None = not yet materialised).
+        self._times      = None
+        self._raw_values = None
+        self._t_min      = None
+        self._t_max      = None
+        self._cum_values = None
+
+    # ------------------------------------------------------------------
+    # Private materialisation helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_sorted(self):
+        """Cast inputs, sort by time, and fetch t_min/t_max.  Runs at most once."""
+        if self._times is not None:
+            return
+        times  = self._input_times
+        values = self._input_values
+        if times.dtype  != ak.float64: times  = ak.cast(times,  ak.float64)
+        if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
+        perm             = ak.argsort(times)
+        self._times      = times[perm]
+        self._raw_values = values[perm] * self._config.scale_factor
+        self._t_min      = self._times[0]
+        self._t_max      = self._times[-1]
+
+    def _ensure_integrated(self):
+        """Compute cum_values from sorted raw_values.  Runs at most once."""
+        if self._cum_values is not None:
+            return
+        self._ensure_sorted()
         if self.kind == MetricType.INSTANTANEOUS:
-            dt = self.times[1:] - self.times[:-1]
+            dt = self._times[1:] - self._times[:-1]
             if self.interp_kind == 'previous':
-                energy_steps = self.raw_values[:-1] * dt
+                energy_steps = self._raw_values[:-1] * dt
             else:
-                avg_watts = (self.raw_values[:-1] + self.raw_values[1:]) * 0.5
+                avg_watts    = (self._raw_values[:-1] + self._raw_values[1:]) * 0.5
                 energy_steps = avg_watts * dt
-            
-            zeros = ak.zeros(1, dtype=ak.float64)
-            self.cum_values = ak.concatenate([zeros, ak.cumsum(energy_steps)])
+            zeros            = ak.zeros(1, dtype=ak.float64)
+            self._cum_values = ak.concatenate([zeros, ak.cumsum(energy_steps)])
         else:
-            self.cum_values = self.raw_values
+            self._cum_values = self._raw_values
+
+    # ------------------------------------------------------------------
+    # Public properties — each triggers only the work it actually needs
+    # ------------------------------------------------------------------
+
+    @property
+    def times(self) -> np.ndarray:
+        self._ensure_sorted()
+        return self._times
+
+    @property
+    def raw_values(self) -> np.ndarray:
+        self._ensure_sorted()
+        return self._raw_values
 
     @property
     def values(self) -> np.ndarray:
         """Alias for raw_values to support legacy/external access."""
         return self.raw_values
+
+    @property
+    def t_min(self):
+        self._ensure_sorted()
+        return self._t_min
+
+    @property
+    def t_max(self):
+        self._ensure_sorted()
+        return self._t_max
+
+    @property
+    def cum_values(self) -> np.ndarray:
+        self._ensure_integrated()
+        return self._cum_values
 
     def get_delta_vectorized(self, t_starts: np.ndarray, t_ends: np.ndarray) -> np.ndarray:
         """
@@ -586,13 +645,41 @@ class AttributionEngine:
             mask_valid = idx_end > idx_start
 
             if strategy == 'exclusive':
-                # Arkouda backend — original depth-loop algorithm
+                # ── Plan F: eliminate redundant searchsorted from the depth loop ──────
+                # The original code called _compute_coverage_ak(r.starts[mask_d],
+                # r.ends[mask_d], breaks) per depth, which internally issues two
+                # ak.searchsorted round-trips every time.  But idx_start and r_idx
+                # (computed just above) already encode those exact searchsorted results
+                # for the full rank.  We can mask them per depth and inline the rest of
+                # the coverage computation, eliminating 2 × D searchsorted RTTs per rank.
                 unique_depths = ak.unique(r.depths)
                 unique_depths = ak.sort(unique_depths)
                 max_depth_per_interval = ak.zeros(breaks.size - 1, dtype=ak.int64) - 1
+
+                # r_idx_cov matches _compute_coverage_ak's r_idx semantics:
+                #   outer r_idx = searchsorted(ends, 'left') - 1
+                #   coverage    = searchsorted(ends, 'left')          ← one more
+                r_idx_cov = r_idx + 1
+
                 for d in unique_depths.to_ndarray():
                     mask_d = r.depths == d
-                    cov = AttributionEngine._compute_coverage_ak(r.starts[mask_d], r.ends[mask_d], breaks)
+                    l_d = idx_start[mask_d]   # max(0, searchsorted(starts,'right')-1)
+                    r_d = r_idx_cov[mask_d]   # searchsorted(ends, 'left')
+                    valid = r_d > l_d
+                    l_v = l_d[valid]
+                    r_v = r_d[valid]
+                    if l_v.size == 0:
+                        continue
+                    idxs  = ak.concatenate([l_v, r_v])
+                    ones  = ak.ones(l_v.size, dtype=ak.int64)
+                    vals  = ak.concatenate([ones, ones * -1])
+                    g_cov = ak.GroupBy(idxs)
+                    uid, svals = g_cov.aggregate(vals, 'sum')
+                    oob  = uid < breaks.size
+                    uid, svals = uid[oob], svals[oob]
+                    diff = ak.zeros(breaks.size, dtype=ak.int64)
+                    diff[uid] += svals
+                    cov  = ak.cumsum(diff)[:-1]
                     max_depth_per_interval = ak.where(cov > 0, d, max_depth_per_interval)
                 cum_resources_by_depth = {}
                 for d in unique_depths.to_ndarray():
