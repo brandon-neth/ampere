@@ -896,15 +896,12 @@ class Ensemble:
         """
         new_dict = {}
         keys = df_dict.keys() if hasattr(df_dict, 'keys') else df_dict.columns
+        # Compute the gather index once so every column reuses it rather than
+        # rebuilding ak.arange(mask.size)[mask] per column.
+        idx = ak.arange(mask.size)[mask] if mask.dtype == ak.bool else mask
         for k in keys:
             col = df_dict[k]
-            if col.size == mask.size:
-                if mask.dtype == ak.bool:
-                    new_dict[k] = col[ak.arange(mask.size)[mask]]
-                else:
-                    new_dict[k] = col[mask]
-            else:
-                new_dict[k] = col 
+            new_dict[k] = col[idx] if col.size == mask.size else col
         return ak.DataFrame(new_dict)
 
     @staticmethod
@@ -965,16 +962,28 @@ class Ensemble:
                         m_df = ak.read_parquet(m_path)
                         if 'metric_name' in m_df and 'time' in m_df and 'value_int' in m_df:
                             m_names = m_df['metric_name']
+
+                            # Cast both columns once upfront so neither this loop nor
+                            # Metric.__init__ needs to cast per-metric (saves ~2×N RTTs).
+                            times_col  = ak.cast(m_df['time'],      ak.float64) if m_df['time'].dtype      != ak.float64 else m_df['time']
+                            values_col = ak.cast(m_df['value_int'], ak.float64) if m_df['value_int'].dtype != ak.float64 else m_df['value_int']
+
+                            # Sort both columns once via the GroupBy permutation, then
+                            # slice by segment boundaries.  Replaces N per-metric
+                            # boolean-mask + gather pairs with 2 gathers + N cheap slices.
                             g = ak.GroupBy(m_names)
                             uk, _ = g.aggregate(m_names, 'first')
                             unique_metrics = uk.to_ndarray().tolist()
-                            
-                            for m_name in unique_metrics:
-                                mask = (m_names == m_name)
-                                times = m_df['time'][mask]
-                                values = m_df['value_int'][mask]
-                                if times.dtype != ak.float64: times = ak.cast(times, ak.float64)
-                                if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
+                            segs           = g.segments.to_ndarray().tolist()
+                            sorted_times   = times_col[g.permutation]
+                            sorted_values  = values_col[g.permutation]
+                            total          = sorted_times.size
+
+                            for i, m_name in enumerate(unique_metrics):
+                                start  = segs[i]
+                                end    = segs[i + 1] if i + 1 < len(segs) else total
+                                times  = sorted_times[start:end]
+                                values = sorted_values[start:end]
                                 cfg = Ensemble._resolve_config(m_name, metric_configs)
                                 metrics.append(Metric(m_name, times, values, cfg))
                         else:
