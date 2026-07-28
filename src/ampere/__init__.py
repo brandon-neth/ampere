@@ -149,7 +149,7 @@ class Metric:
 
         # 2. Integrate
         if self.kind == MetricType.INSTANTANEOUS:
-            dt = self.times[1:] - self.times[:-1]
+            dt = self.times[1:] - self.times[:-1] # Performs ~2x as well as using ak.diff
             if self.interp_kind == 'previous':
                 energy_steps = self.raw_values[:-1] * dt
             else:
@@ -1057,8 +1057,8 @@ class Ensemble:
                     c_df = ak.DataFrame(data)
                     
                     # Filter: End > Start
-                    mask = c_df['End Time'] > c_df['Start Time']
-                    c_df = Ensemble._apply_filter_to_dict(c_df, mask)
+                    #mask = c_df['End Time'] > c_df['Start Time']
+                    # c_df = Ensemble._apply_filter_to_dict(c_df, mask)
                     
                     # Identify Rank ID from path or group
                     # We first check the Group column, which is reliable if consistent.
