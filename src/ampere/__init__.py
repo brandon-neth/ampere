@@ -94,6 +94,7 @@ def ak_interp1d(x: np.ndarray, y: np.ndarray, xi: np.ndarray, kind: str = 'linea
         np.ndarray: The interpolated values.
     """
     # 1. Find indices of xi in x
+
     idx = ak.searchsorted(x, xi)
     
     # 2. Clamp indices to valid range [1, n-1]
@@ -149,7 +150,7 @@ class Metric:
 
         # 2. Integrate
         if self.kind == MetricType.INSTANTANEOUS:
-            dt = self.times[1:] - self.times[:-1] # Performs ~2x as well as using ak.diff
+            dt = self.times[1:] - self.times[:-1] # Performs ~5x as well as using ak.diff
             if self.interp_kind == 'previous':
                 energy_steps = self.raw_values[:-1] * dt
             else:
@@ -267,7 +268,9 @@ class AttributionEngine:
             c_idx = all_idx[child_mask]
             c_key = pos_key[child_mask]
 
-            pos = ak.searchsorted(pp_key_s, c_key, side='right') - 1
+            if not c_key.is_sorted():
+                print("c_key not sorted in _exclusive_ak")
+            pos = ak.searchsorted(pp_key_s, c_key, side='right', x2_sorted=True) - 1
             valid = pos >= 0
             pos_c = ak.where(valid, pos, 0)
             cand = pp_orig_s[pos_c]
@@ -590,10 +593,10 @@ class AttributionEngine:
             deltas = breaks[1:] - breaks[:-1]
 
         # 3. Per-segment break indices (bulk searchsorted over all segments).
-        L = ak.searchsorted(breaks, S, side='right') - 1
+        L = ak.searchsorted(breaks, S, side='right', x2_sorted=True) - 1
         L = ak.where(L < 0, 0, L)
         L = ak.where(L > N, N, L)
-        R = ak.searchsorted(breaks, E, side='left')
+        R = ak.searchsorted(breaks, E, side='left', x2_sorted=True)
         R = ak.where(R > N, N, R)
 
         # 4. Active-rank count per interval (shared mode) with NO per-rank loop.
