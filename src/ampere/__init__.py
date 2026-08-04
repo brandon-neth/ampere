@@ -140,7 +140,8 @@ class Metric:
         # 1. Sort
         perm = ak.argsort(times)
         self.times = times[perm]
-        self.raw_values = values[perm] * config.scale_factor
+        self.raw_values = values[perm]
+        self.raw_values *= config.scale_factor
         
         self.t_min = self.times[0]
         self.t_max = self.times[-1]
@@ -150,15 +151,19 @@ class Metric:
 
         # 2. Integrate
         if self.kind == MetricType.INSTANTANEOUS:
-            dt = self.times[1:] - self.times[:-1] # Performs ~5x as well as using ak.diff
+            energy_steps = ak.diff(self.times)
             if self.interp_kind == 'previous':
-                energy_steps = self.raw_values[:-1] * dt
+                tmp2 = self.raw_values[:-1]
+                energy_steps *= tmp2
             else:
-                avg_watts = (self.raw_values[:-1] + self.raw_values[1:]) * 0.5
-                energy_steps = avg_watts * dt
+                tmp5 = self.raw_values[:-1]
+                tmp6 = self.raw_values[1:]
+                avg_watts = (tmp5 + tmp6) * 0.5
+                energy_steps *= avg_watts
             
             zeros = ak.zeros(1, dtype=ak.float64)
-            self.cum_values = ak.concatenate([zeros, ak.cumsum(energy_steps)])
+            tmp3 = ak.cumsum(energy_steps)
+            self.cum_values = ak.concatenate([zeros, tmp3])
         else:
             self.cum_values = self.raw_values
 
